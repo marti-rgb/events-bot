@@ -107,7 +107,10 @@ async def run_parser(limit_per_channel: int = 20):
     logging.info(f"Недоступные каналы (приватные): {UNAVAILABLE_CHANNELS}")
     
     client = TelegramClient('events_session', API_ID, API_HASH)
-    await client.start()
+    await client.connect()
+    if not await client.is_user_authorized():
+        # Анонимный режим — только публичные каналы
+        pass
     
     total_processed = 0
     total_saved = 0
