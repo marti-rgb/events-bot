@@ -1,129 +1,117 @@
 import asyncio
 import logging
-from telethon import TelegramClient
-from telethon.errors import ChannelPrivateError, UsernameNotOccupiedError, FloodWaitError
+import httpx
+from bs4 import BeautifulSoup
 from analyzer import analyze_post
 from database import is_post_processed, mark_post_processed, save_event
 from channels_config import CHANNELS, UNAVAILABLE_CHANNELS
 
-API_ID = 2040
-API_HASH = 'b18441a1ff607e10a989891a5462e627'
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+}
 
-async def parse_channel(client: TelegramClient, channel_config: dict, limit: int = 50):
+async def fetch_channel_posts(client: httpx.AsyncClient, channel: str) -> list[dict]:
+    url = f'https://t.me/s/{channel}'
+    try:
+        response = await client.get(url, headers=HEADERS, timeout=15)
+        if response.status_code != 200:
+            logging.error(f"❌ @{channel} недоступен: HTTP {response.status_code}")
+            return []
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        messages = soup.find_all('div', class_='tgme_widget_message')
+        
+        posts = []
+        for msg in messages:
+            msg_link = msg.get('data-post', '')
+            if not msg_link:
+                continue
+            msg_id = msg_link.split('/')[-1]
+            
+            text_div = msg.find('div', class_='tgme_widget_message_text')
+            text = text_div.get_text(separator='\n').strip() if text_div else ''
+            
+            if not text:
+                continue
+            
+            posts.append({
+                'id': msg_id,
+                'text': text,
+                'url': f'https://t.me/{channel}/{msg_id}'
+            })
+        
+        return posts
+    except Exception as e:
+        logging.error(f"❌ Ошибка получения @{channel}: {e}")
+        return []
+
+async def parse_channel(client: httpx.AsyncClient, channel_config: dict):
     channel = channel_config['channel']
-    threads = channel_config.get('threads')
-    exclude_threads = channel_config.get('exclude_threads', [])
+    exclude_ids = [str(i) for i in channel_config.get('exclude_threads', [])]
+    whitelist_ids = [str(i) for i in (channel_config.get('threads') or [])]
     
     saved = 0
     processed = 0
     
-    try:
-        entity = await client.get_entity(f'@{channel}')
-    except (ChannelPrivateError, UsernameNotOccupiedError, ValueError) as e:
-        logging.error(f"❌ Канал @{channel} недоступен: {e}")
+    posts = await fetch_channel_posts(client, channel)
+    
+    if not posts:
         return 0, 0
-
-    try:
-        if threads:
-            # Парсим только указанные треды
-            for thread_id in threads:
-                async for message in client.iter_messages(entity, reply_to=thread_id, limit=limit):
-                    if not message.text:
-                        continue
-                    if is_post_processed(channel, message.id):
-                        continue
-                    
-                    processed += 1
-                    result = await analyze_post(message.text)
-                    mark_post_processed(channel, message.id)
-                    
-                    if result and result.get('is_event'):
-                        event = {
-                            'title': result.get('title'),
-                            'date': result.get('date'),
-                            'time': result.get('time'),
-                            'is_free': 1 if result.get('is_free') else 0,
-                            'for_children': 1 if result.get('for_children') else 0,
-                            'format': result.get('format', 'unknown'),
-                            'category': result.get('category', 'другое'),
-                            'description': result.get('description'),
-                            'source_url': f'https://t.me/{channel}/{message.id}',
-                            'channel': channel,
-                            'city': 'Москва',
-                        }
-                        if save_event(event):
-                            saved += 1
-                            logging.info(f"✅ Сохранено: {event['title']} | {event['date']}")
-                    
-                    await asyncio.sleep(1.5)  # Rate limit Gemini
-        else:
-            # Парсим весь канал
-            async for message in client.iter_messages(entity, limit=limit):
-                if not message.text:
-                    continue
-                
-                # Пропускаем исключённые треды
-                if message.reply_to and hasattr(message.reply_to, 'reply_to_msg_id'):
-                    if message.reply_to.reply_to_msg_id in exclude_threads:
-                        continue
-                
-                if is_post_processed(channel, message.id):
-                    continue
-                
-                processed += 1
-                result = await analyze_post(message.text)
-                mark_post_processed(channel, message.id)
-                
-                if result and result.get('is_event'):
-                    event = {
-                        'title': result.get('title'),
-                        'date': result.get('date'),
-                        'time': result.get('time'),
-                        'is_free': 1 if result.get('is_free') else 0,
-                        'for_children': 1 if result.get('for_children') else 0,
-                        'format': result.get('format', 'unknown'),
-                        'category': result.get('category', 'другое'),
-                        'description': result.get('description'),
-                        'source_url': f'https://t.me/{channel}/{message.id}',
-                        'channel': channel,
-                        'city': 'Москва',
-                    }
-                    if save_event(event):
-                        saved += 1
-                        logging.info(f"✅ Сохранено: {event['title']} | {event['date']}")
-                
-                await asyncio.sleep(1.5)
-
-    except FloodWaitError as e:
-        logging.warning(f"FloodWait {e.seconds}s для @{channel}")
-        await asyncio.sleep(e.seconds)
-    except Exception as e:
-        logging.error(f"Ошибка парсинга @{channel}: {e}")
+    
+    for post in posts:
+        msg_id = post['id']
+        
+        if whitelist_ids and msg_id not in whitelist_ids:
+            continue
+        
+        if msg_id in exclude_ids:
+            continue
+        
+        if is_post_processed(channel, int(msg_id)):
+            continue
+        
+        processed += 1
+        result = await analyze_post(post['text'])
+        mark_post_processed(channel, int(msg_id))
+        
+        if result and result.get('is_event'):
+            event = {
+                'title': result.get('title'),
+                'date': result.get('date'),
+                'time': result.get('time'),
+                'is_free': 1 if result.get('is_free') else 0,
+                'for_children': 1 if result.get('for_children') else 0,
+                'format': result.get('format', 'unknown'),
+                'category': result.get('category', 'другое'),
+                'description': result.get('description'),
+                'source_url': post['url'],
+                'channel': channel,
+                'city': 'Москва',
+            }
+            if save_event(event):
+                saved += 1
+                logging.info(f"✅ {event['title']} | {event['date']} | @{channel}")
+        
+        await asyncio.sleep(1.5)
     
     return processed, saved
 
-async def run_parser(limit_per_channel: int = 20):
-    logging.info("Начинаем парсинг...")
+async def run_parser():
+    logging.info("Начинаем парсинг через t.me/s/...")
     logging.info(f"Недоступные каналы (приватные): {UNAVAILABLE_CHANNELS}")
-    
-    client = TelegramClient('events_session', API_ID, API_HASH)
-    await client.connect()
-    if not await client.is_user_authorized():
-        # Анонимный режим — только публичные каналы
-        pass
     
     total_processed = 0
     total_saved = 0
     
-    for channel_config in CHANNELS:
-        channel = channel_config['channel']
-        logging.info(f"Парсим @{channel}...")
-        processed, saved = await parse_channel(client, channel_config, limit=limit_per_channel)
-        total_processed += processed
-        total_saved += saved
-        logging.info(f"@{channel}: обработано {processed}, сохранено {saved}")
-        await asyncio.sleep(3)  # Пауза между каналами
+    async with httpx.AsyncClient() as client:
+        for channel_config in CHANNELS:
+            channel = channel_config['channel']
+            logging.info(f"Парсим @{channel}...")
+            processed, saved = await parse_channel(client, channel_config)
+            total_processed += processed
+            total_saved += saved
+            logging.info(f"@{channel}: обработано {processed}, сохранено {saved}")
+            await asyncio.sleep(2)
     
-    await client.disconnect()
-    logging.info(f"Парсинг завершён. Всего обработано: {total_processed}, сохранено мероприятий: {total_saved}")
+    logging.info(f"Готово. Обработано: {total_processed}, сохранено: {total_saved}")
     return total_processed, total_saved
