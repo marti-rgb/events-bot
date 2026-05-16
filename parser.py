@@ -104,7 +104,9 @@ async def run_parser():
     total_saved = 0
     
     async with httpx.AsyncClient() as client:
-        for channel_config in CHANNELS:
+        for CHANNELS = load_channels()
+            FILTER_KEYWORDS = load_keywords()
+            for channel_config in CHANNELS:
             channel = channel_config['channel']
             logging.info(f"Парсим @{channel}...")
             processed, saved = await parse_channel(client, channel_config)
