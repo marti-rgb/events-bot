@@ -4,7 +4,7 @@ import httpx
 from bs4 import BeautifulSoup
 from analyzer import analyze_post
 from database import is_post_processed, mark_post_processed, save_event
-from channels_config import CHANNELS, UNAVAILABLE_CHANNELS
+from sheets_config import load_channels, load_keywords, UNAVAILABLE_CHANNELS
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
