@@ -98,18 +98,20 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict):
 
 async def run_parser():
     logging.info("Начинаем парсинг через t.me/s/...")
-    logging.info(f"Недоступные каналы (приватные): {UNAVAILABLE_CHANNELS}")
+    
+    CHANNELS = load_channels()
+    FILTER_KEYWORDS = load_keywords()
+    
+    logging.info(f"Каналов: {len(CHANNELS)}, ключевых слов: {len(FILTER_KEYWORDS)}")
     
     total_processed = 0
     total_saved = 0
     
     async with httpx.AsyncClient() as client:
-        for CHANNELS = load_channels()
-            FILTER_KEYWORDS = load_keywords()
-            for channel_config in CHANNELS:
+        for channel_config in CHANNELS:
             channel = channel_config['channel']
             logging.info(f"Парсим @{channel}...")
-            processed, saved = await parse_channel(client, channel_config)
+            processed, saved = await parse_channel(client, channel_config, FILTER_KEYWORDS)
             total_processed += processed
             total_saved += saved
             logging.info(f"@{channel}: обработано {processed}, сохранено {saved}")
