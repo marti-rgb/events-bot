@@ -46,6 +46,7 @@ async def analyze_post(text: str) -> dict | None:
                 raw = raw[4:]
         
         data = json.loads(raw.strip())
+        logging.info(f"Gemini: {data}")
         return data
     except json.JSONDecodeError as e:
         logging.warning(f"JSON parse error: {e}")
