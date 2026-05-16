@@ -1,16 +1,13 @@
 import os
 import json
 import logging
-import google.generativeai as genai
+from groq import Groq
 
-genai.configure(api_key=os.getenv('GEMINI_API_KEY'))
-model = genai.GenerativeModel('gemini-2.0-flash')
+client = Groq(api_key=os.getenv('GROQ_API_KEY'))
 
 PROMPT_TEMPLATE = """Проанализируй пост из Telegram-канала. Верни ТОЛЬКО валидный JSON без markdown, без пояснений.
-
 Пост:
 {text}
-
 JSON-структура:
 {{
   "is_event": true/false,
@@ -23,7 +20,6 @@ JSON-структура:
   "category": "одно из: настолки/культура/спорт/образование/музыка/кино/театр/выставка/лекция/мастер-класс/вечеринка/другое",
   "description": "краткое описание до 200 символов или null"
 }}
-
 Правила:
 - is_event = true только если это анонс конкретного мероприятия с датой или временем
 - format = offline если есть адрес/место, online если zoom/трансляция/онлайн, unknown если непонятно
@@ -35,22 +31,27 @@ async def analyze_post(text: str) -> dict | None:
         return None
     
     try:
-        prompt = PROMPT_TEMPLATE.format(text=text[:3000])
-        response = model.generate_content(prompt)
-        raw = response.text.strip()
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[
+                {"role": "user", "content": PROMPT_TEMPLATE.format(text=text[:3000])}
+            ],
+            temperature=0.1,
+            max_tokens=500,
+        )
+        raw = response.choices[0].message.content.strip()
         
-        # Убираем markdown если есть
         if raw.startswith('```'):
             raw = raw.split('```')[1]
             if raw.startswith('json'):
                 raw = raw[4:]
         
         data = json.loads(raw.strip())
-        logging.info(f"Gemini: {data}")
+        logging.info(f"Groq: {data}")
         return data
     except json.JSONDecodeError as e:
         logging.warning(f"JSON parse error: {e}")
         return None
     except Exception as e:
-        logging.error(f"Gemini API error: {e}")
+        logging.error(f"Groq API error: {e}")
         return None
