@@ -2,8 +2,8 @@ name: Parse Events
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # каждые 6 часов
-  workflow_dispatch:  # ручной запуск
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
 
 jobs:
   parse:
@@ -20,9 +20,9 @@ jobs:
 
       - name: Install dependencies
         run: |
-         pip install -r requirements.txt
-         pip install psycopg2-binary
-         
+          pip install -r requirements.txt
+          pip install psycopg2-binary
+
       - name: Run parser
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
