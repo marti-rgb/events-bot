@@ -23,7 +23,7 @@ jobs:
           pip install -r requirements.txt
           pip install psycopg2-binary==2.9.9
 
-- name: Run parser
+      - name: Run parser
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
