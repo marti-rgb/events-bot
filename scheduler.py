@@ -6,14 +6,14 @@ from parser import run_parser
 
 async def scheduled_parse():
     logging.info("Запуск по расписанию...")
-    await run_parser(limit_per_channel=20)
+    await run_parser()
 
 async def start_scheduler():
     init_db()
     logging.info("БД инициализирована")
     
     # Первый запуск сразу при старте
-    await run_parser(limit_per_channel=20)
+    await run_parser()
     
     # Далее каждые 6 часов
     scheduler = AsyncIOScheduler()
