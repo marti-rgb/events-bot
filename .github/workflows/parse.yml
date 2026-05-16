@@ -19,9 +19,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install psycopg2-binary
+        run: pip install -r requirements.txt
 
       - name: Run parser
         env:
