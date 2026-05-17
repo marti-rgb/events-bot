@@ -87,6 +87,7 @@ def save_event(event: dict) -> bool:
     conn = get_conn()
     c = conn.cursor()
     try:
+        logging.info(f"categories before save: {event.get('category_l1_arr')} / {event.get('category_l2_arr')}")
         event['category_l1_arr'] = json.dumps(event.get('category_l1_arr', []), ensure_ascii=False)
         event['category_l2_arr'] = json.dumps(event.get('category_l2_arr', []), ensure_ascii=False)
         c.execute('''
