@@ -80,7 +80,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
         result = await analyze_post(post['text'])
         mark_post_processed(channel, int(msg_id))
         
-        if result and result.get('is_event'):
+        if result and result.get('is_event') and result.get('date'):
             event = {
                 'title': result.get('title'),
                 'date': result.get('date'),
@@ -90,6 +90,9 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 'format': result.get('format', 'unknown'),
                 'category': result.get('category', 'другое'),
                 'description': result.get('description'),
+                'location': result.get('location'),
+                'address': result.get('address'),
+                'price': result.get('price'),
                 'source_url': post['url'],
                 'channel': channel,
                 'city': channel_config.get('city', 'Москва'),
