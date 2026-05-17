@@ -74,7 +74,7 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=800,
+                max_tokens=2000,
             )
             raw = response.choices[0].message.content.strip()
 
