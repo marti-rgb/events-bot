@@ -93,3 +93,15 @@ def match_category_l2(groq_l2: str, categories: dict, l1: str) -> str:
         if l2.lower() in groq_lower or groq_lower in l2.lower():
             return l2
     return groq_l2
+
+def load_stop_tags() -> list[str]:
+    try:
+        rows = get_sheet_csv('Стоп-теги')
+        if not rows:
+            return []
+        tags = [row[0].strip().lower() for row in rows[1:] if row and row[0].strip()]
+        logging.info(f"Загружено стоп-тегов: {len(tags)}")
+        return tags
+    except Exception as e:
+        logging.error(f"Ошибка загрузки стоп-тегов: {e}")
+        return []
