@@ -81,7 +81,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 continue
         
         processed += 1
-        result = await analyze_post(post['text'], post.get('post_date', ''))
+        result = await analyze_post(post['text'], post.get('post_date', ''), categories)
         mark_post_processed(channel, int(msg_id))
         
         if result and result.get('is_event') and result.get('date'):
