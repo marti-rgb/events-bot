@@ -6,6 +6,7 @@ from groq import Groq
 client = Groq(api_key=os.getenv('GROQ_API_KEY'))
 
 PROMPT_TEMPLATE = """Проанализируй пост из Telegram-канала. Верни ТОЛЬКО валидный JSON без markdown, без пояснений.
+Дата публикации поста: {post_date}
 Пост:
 {text}
 JSON-структура:
