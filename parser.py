@@ -49,7 +49,7 @@ async def fetch_channel_posts(client: httpx.AsyncClient, channel: str) -> list[d
         logging.error(f"❌ Ошибка получения @{channel}: {e}")
         return []
 
-async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_keywords: list = []):
+async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_keywords: list = [], categories: dict = {}):
     channel = channel_config['channel']
     exclude_ids = [str(i) for i in channel_config.get('exclude_threads', [])]
     whitelist_ids = [str(i) for i in (channel_config.get('threads') or [])]
