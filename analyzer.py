@@ -48,6 +48,7 @@ JSON-структура:
 - location = название клуба/кафе/площадки
 - address = улица/метро если указаны
 - category_l1_arr и category_l2_arr — ТОЛЬКО значения из предоставленного списка
+- is_event = false если пост описывает прошедшее мероприятие
 - is_event = false если пост является расписанием, заголовком, афишей без конкретного описания мероприятия"""
 
 async def analyze_post(text: str, post_date: str = '', categories: dict = {}) -> dict | None:
