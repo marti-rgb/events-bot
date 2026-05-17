@@ -101,6 +101,8 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 'source_url': post['url'],
                 'channel': channel,
                 'city': channel_config.get('city', 'Москва'),
+                'category_l1_arr': result.get('category_l1_arr', []),
+                'category_l2_arr': result.get('category_l2_arr', []),
             }
             if save_event(event):
                 saved += 1
