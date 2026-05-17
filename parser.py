@@ -34,10 +34,14 @@ async def fetch_channel_posts(client: httpx.AsyncClient, channel: str) -> list[d
             if not text:
                 continue
             
+            date_tag = msg.find('time')
+            post_date = date_tag.get('datetime', '')[:10] if date_tag else ''
+
             posts.append({
                 'id': msg_id,
                 'text': text,
-                'url': f'https://t.me/{channel}/{msg_id}'
+                'url': f'https://t.me/{channel}/{msg_id}',
+                'post_date': post_date
             })
         
         return posts
@@ -77,7 +81,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 continue
         
         processed += 1
-        result = await analyze_post(post['text'])
+        result = await analyze_post(post['text'], post.get('post_date', ''))
         mark_post_processed(channel, int(msg_id))
         
         if result and result.get('is_event') and result.get('date'):
