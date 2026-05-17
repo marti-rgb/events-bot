@@ -1,9 +1,19 @@
 import os
 import json
 import logging
-from groq import Groq
+from openai import OpenAI
 
-client = Groq(api_key=os.getenv('GROQ_API_KEY'))
+cerebras_client = OpenAI(
+    base_url="https://api.cerebras.ai/v1",
+    api_key=os.getenv('CEREBRAS_API_KEY')
+)
+
+groq_client = None
+try:
+    from groq import Groq
+    groq_client = Groq(api_key=os.getenv('GROQ_API_KEY'))
+except:
+    pass
 
 PROMPT_TEMPLATE = """Проанализируй пост из Telegram-канала. Верни ТОЛЬКО валидный JSON без markdown, без пояснений.
 Дата публикации поста: {post_date}
@@ -40,28 +50,36 @@ async def analyze_post(text: str, post_date: str = '') -> dict | None:
     if not text or len(text.strip()) < 20:
         return None
     
-    try:
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "user", "content": PROMPT_TEMPLATE.format(text=text[:3000], post_date=post_date)}
-            ],
-            temperature=0.1,
-            max_tokens=800,
-        )
-        raw = response.choices[0].message.content.strip()
-        
-        if raw.startswith('```'):
-            raw = raw.split('```')[1]
-            if raw.startswith('json'):
-                raw = raw[4:]
-        
-        data = json.loads(raw.strip())
-        logging.info(f"Groq: {data}")
-        return data
-    except json.JSONDecodeError as e:
-        logging.warning(f"JSON parse error: {e}")
-        return None
-    except Exception as e:
-        logging.error(f"Groq API error: {e}")
-        return None
+    for attempt, (client, model) in enumerate([
+        (cerebras_client, "llama-3.1-8b"),
+        (groq_client, "llama-3.3-70b-versatile")
+    ]):
+        if client is None:
+            continue
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "user", "content": PROMPT_TEMPLATE.format(text=text[:3000], post_date=post_date)}
+                ],
+                temperature=0.1,
+                max_tokens=800,
+            )
+            raw = response.choices[0].message.content.strip()
+            
+            if raw.startswith('```'):
+                raw = raw.split('```')[1]
+                if raw.startswith('json'):
+                    raw = raw[4:]
+            
+            data = json.loads(raw.strip())
+            logging.info(f"{'Cerebras' if attempt == 0 else 'Groq'}: {data}")
+            return data
+        except json.JSONDecodeError as e:
+            logging.warning(f"JSON parse error: {e}")
+            continue
+        except Exception as e:
+            logging.error(f"API error ({'Cerebras' if attempt == 0 else 'Groq'}): {e}")
+            continue
+    
+    return None
