@@ -19,6 +19,8 @@ PROMPT_TEMPLATE = """Проанализируй пост из Telegram-кана�
 Дата публикации поста: {post_date}
 Пост:
 {text}
+Доступные категории:
+{l2_json}
 JSON-структура:
 {{
   "is_event": true/false,
@@ -31,8 +33,8 @@ JSON-структура:
   "format": "offline/online/unknown",
   "location": "название места проведения или null",
   "address": "адрес или метро или null",
-  "category_l1": "одно из: Культура и искусство/Музыка/Кино/Театр и шоу/Выставки/Спорт и активности/Образование и лекции/Игры/Вечеринки и тусовки/Фестивали/Для детей/Знакомства/Психология и практики/Бизнес и нетворкинг/Творчество/Онлайн/другое",
-  "category_l2": "уточнение категории свободным текстом или null",
+  "category_l1_arr": ["до 3 категорий из: {l1_list}"],
+  "category_l2_arr": ["до 3 подкатегорий ТОЛЬКО из списка выше, пустой массив [] если нет подходящих"],
   "description": "подробное описание до 500 символов или null"
 }}
 Правила:
@@ -44,12 +46,23 @@ JSON-структура:
 - for_children = true если явно для детей или семей с детьми
 - price = сумма в рублях текстом если указана, null если неизвестно
 - location = название клуба/кафе/площадки
-- address = улица/метро если указаны"""
+- address = улица/метро если указаны
+- category_l1_arr и category_l2_arr — ТОЛЬКО значения из предоставленного списка"""
 
 async def analyze_post(text: str, post_date: str = '', categories: dict = {}) -> dict | None:
     if not text or len(text.strip()) < 20:
         return None
-    
+
+    l1_list = "/".join(categories.keys()) if categories else "Культура и искусство/Музыка/Кино/Театр и шоу/Выставки/Спорт и активности/Образование и лекции/Игры/Вечеринки и тусовки/Фестивали/Для детей/Знакомства/Психология и практики/Бизнес и нетворкинг/Творчество/Онлайн"
+    l2_json = json.dumps(categories, ensure_ascii=False) if categories else "{}"
+
+    prompt = PROMPT_TEMPLATE.format(
+        text=text[:3000],
+        post_date=post_date,
+        l1_list=l1_list,
+        l2_json=l2_json
+    )
+
     for attempt, (client, model) in enumerate([
         (cerebras_client, "llama-3.1-8b"),
         (groq_client, "llama-3.3-70b-versatile")
@@ -59,19 +72,17 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
         try:
             response = client.chat.completions.create(
                 model=model,
-                messages=[
-                    {"role": "user", "content": PROMPT_TEMPLATE.format(text=text[:3000], post_date=post_date)}
-                ],
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=800,
             )
             raw = response.choices[0].message.content.strip()
-            
+
             if raw.startswith('```'):
                 raw = raw.split('```')[1]
                 if raw.startswith('json'):
                     raw = raw[4:]
-            
+
             data = json.loads(raw.strip())
             logging.info(f"{'Cerebras' if attempt == 0 else 'Groq'}: {data}")
             return data
@@ -81,5 +92,5 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
         except Exception as e:
             logging.error(f"API error ({'Cerebras' if attempt == 0 else 'Groq'}): {e}")
             continue
-    
+
     return None
