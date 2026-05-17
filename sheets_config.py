@@ -57,3 +57,39 @@ def load_keywords() -> list[str]:
         return []
 
 UNAVAILABLE_CHANNELS = []
+def load_categories() -> dict:
+    try:
+        rows = get_sheet_csv('Категории')
+        if not rows:
+            return {}
+        header = [h.lower() for h in rows[0]]
+        l1_idx = header.index('category_l1')
+        l2_idx = header.index('category_l2')
+        
+        categories = {}
+        for row in rows[1:]:
+            if len(row) <= max(l1_idx, l2_idx):
+                continue
+            l1 = row[l1_idx].strip()
+            l2 = row[l2_idx].strip()
+            if not l1:
+                continue
+            if l1 not in categories:
+                categories[l1] = []
+            if l2:
+                categories[l1].append(l2)
+        
+        logging.info(f"Загружено категорий l1: {len(categories)}")
+        return categories
+    except Exception as e:
+        logging.error(f"Ошибка загрузки категорий: {e}")
+        return {}
+
+def match_category_l2(groq_l2: str, categories: dict, l1: str) -> str:
+    if not groq_l2 or not l1 or l1 not in categories:
+        return groq_l2 or 'другое'
+    groq_lower = groq_l2.lower().strip()
+    for l2 in categories[l1]:
+        if l2.lower() in groq_lower or groq_lower in l2.lower():
+            return l2
+    return groq_l2
