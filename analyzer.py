@@ -46,7 +46,7 @@ JSON-структура:
 - location = название клуба/кафе/площадки
 - address = улица/метро если указаны"""
 
-async def analyze_post(text: str, post_date: str = '') -> dict | None:
+async def analyze_post(text: str, post_date: str = '', categories: dict = {}) -> dict | None:
     if not text or len(text.strip()) < 20:
         return None
     
