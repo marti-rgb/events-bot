@@ -86,8 +86,8 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
                     raw = raw[4:]
 
             data = json.loads(raw.strip())
-            if isinstance(data, list):
-                data = data[0] if data else None
+            if data and isinstance(data.get('category_l2_arr'), list):
+            data['category_l2_arr'] = [x.lower() for x in data['category_l2_arr']]
             logging.info(f"{'Cerebras' if attempt == 0 else 'Groq'}: {data}")
             return data
             
