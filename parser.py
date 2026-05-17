@@ -125,7 +125,7 @@ async def run_parser():
         for channel_config in CHANNELS:
             channel = channel_config['channel']
             logging.info(f"Парсим @{channel}...")
-            processed, saved = await parse_channel(client, channel_config, FILTER_KEYWORDS)
+            processed, saved = await parse_channel(client, channel_config, FILTER_KEYWORDS, CATEGORIES)
             total_processed += processed
             total_saved += saved
             logging.info(f"@{channel}: обработано {processed}, сохранено {saved}")
