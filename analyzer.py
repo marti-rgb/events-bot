@@ -44,7 +44,7 @@ JSON-структура:
 - Если год не указан — используй год из даты публикации поста
 - format = offline если есть адрес/место, online если zoom/трансляция/онлайн, unknown если непонятно
 - for_children = true если явно для детей или семей с детьми
-- price = сумма в рублях текстом если указана, null если неизвестно
+- price = минимальная цена числом (только цифры, без знаков и слов), null если неизвестно или бесплатно
 - location = название клуба/кафе/площадки
 - address = улица/метро если указаны
 - category_l1_arr и category_l2_arr — ТОЛЬКО значения из предоставленного списка"""
@@ -84,6 +84,8 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
                     raw = raw[4:]
 
             data = json.loads(raw.strip())
+            if isinstance(data, list):
+            data = data[0] if data else None
             if isinstance(data, list):
             data = data[0] if data else None
             logging.info(f"{'Cerebras' if attempt == 0 else 'Groq'}: {data}")
