@@ -40,7 +40,7 @@ async def analyze_post(text: str, post_date: str = '') -> dict | None:
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
-                {"role": "user", "content": PROMPT_TEMPLATE.format(text=text[:3000])}
+                {"role": "user", "content": PROMPT_TEMPLATE.format(text=text[:3000], post_date=post_date)}
             ],
             temperature=0.1,
             max_tokens=800,
