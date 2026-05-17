@@ -114,6 +114,7 @@ async def run_parser():
     
     CHANNELS = load_channels()
     FILTER_KEYWORDS = load_keywords()
+    CATEGORIES = load_categories()
     
     logging.info(f"Каналов: {len(CHANNELS)}, ключевых слов: {len(FILTER_KEYWORDS)}")
     
