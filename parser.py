@@ -49,7 +49,7 @@ async def fetch_channel_posts(client: httpx.AsyncClient, channel: str) -> list[d
         logging.error(f"❌ Ошибка получения @{channel}: {e}")
         return []
 
-async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_keywords: list = [], categories: dict = {}):
+async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_keywords: list = [], categories: dict = {}, stop_tags: list = []):
     channel = channel_config['channel']
     exclude_ids = [str(i) for i in channel_config.get('exclude_threads', [])]
     whitelist_ids = [str(i) for i in (channel_config.get('threads') or [])]
@@ -129,7 +129,7 @@ async def run_parser():
         for channel_config in CHANNELS:
             channel = channel_config['channel']
             logging.info(f"Парсим @{channel}...")
-            processed, saved = await parse_channel(client, channel_config, FILTER_KEYWORDS, CATEGORIES)
+            processed, saved = await parse_channel(client, channel_config, FILTER_KEYWORDS, CATEGORIES, STOP_TAGS)
             total_processed += processed
             total_saved += saved
             logging.info(f"@{channel}: обработано {processed}, сохранено {saved}")
