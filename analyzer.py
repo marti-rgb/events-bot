@@ -84,6 +84,8 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
                     raw = raw[4:]
 
             data = json.loads(raw.strip())
+            if isinstance(data, list):
+            data = data[0] if data else None
             logging.info(f"{'Cerebras' if attempt == 0 else 'Groq'}: {data}")
             return data
         except json.JSONDecodeError as e:
