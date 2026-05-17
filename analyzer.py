@@ -94,6 +94,11 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
             if data and categories:
                 valid_l2 = [l2.lower() for l1_list in categories.values() for l2 in l1_list]
                 data['category_l2_arr'] = [x for x in data.get('category_l2_arr', []) if x in valid_l2]
+            if data and categories:
+                valid_l1 = list(categories.keys())
+                data['category_l1_arr'] = [x for x in data.get('category_l1_arr', []) if x in valid_l1]
+            if data and not data.get('category_l1_arr'):
+                data['is_event'] = False
             logging.info(f"{'Cerebras' if attempt == 0 else 'Groq'}: {data}")
             return data
             
