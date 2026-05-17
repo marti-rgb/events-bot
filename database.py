@@ -87,8 +87,8 @@ def save_event(event: dict) -> bool:
     c = conn.cursor()
     try:
         c.execute('''
-            INSERT INTO events (title, date, time, is_free, for_children, format, category, description, source_url, channel, city)
-            VALUES (%(title)s, %(date)s, %(time)s, %(is_free)s, %(for_children)s, %(format)s, %(category)s, %(description)s, %(source_url)s, %(channel)s, %(city)s)
+            INSERT INTO events (title, date, time, is_free, for_children, format, category, description, location, address, price, source_url, channel, city)
+            VALUES (%(title)s, %(date)s, %(time)s, %(is_free)s, %(for_children)s, %(format)s, %(category)s, %(description)s, %(location)s, %(address)s, %(price)s, %(source_url)s, %(channel)s, %(city)s)
             ON CONFLICT (source_url) DO NOTHING
         ''', event)
         conn.commit()
