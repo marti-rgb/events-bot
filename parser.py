@@ -79,6 +79,9 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             if not any(kw.lower() in text_lower for kw in filter_keywords):
                 mark_post_processed(channel, int(msg_id))
                 continue
+        if stop_tags and any(tag in post['text'].lower() for tag in stop_tags):
+            mark_post_processed(channel, int(msg_id))
+            continue
         
         processed += 1
         result = await analyze_post(post['text'], post.get('post_date', ''), categories)
