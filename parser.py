@@ -108,6 +108,9 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 'category_l2_arr': result.get('category_l2_arr', []),
             }
             if save_event(event):
+                if len(result.get('category_l1_arr', [])) >= 16:
+                    mark_post_processed(channel, int(msg_id))
+                    continue
                 saved += 1
                 logging.info(f"✅ {event['title']} | {event['date']} | @{channel}")
         
