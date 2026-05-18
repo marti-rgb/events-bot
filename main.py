@@ -1,4 +1,6 @@
 import asyncio
+import os
+os.environ['TZ'] = 'Europe/Moscow'
 import logging
 from scheduler import start_scheduler
 
