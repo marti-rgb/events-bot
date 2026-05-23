@@ -86,6 +86,15 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
         
         processed += 1
         result = await analyze_post(post['text'], post.get('post_date', ''), categories)
+        log_parse(
+            channel=channel,
+            post_id=str(msg_id),
+            model=result.get('model') if result else None,
+            fallback=result.get('model', '').startswith('groq') if result else False,
+            success=bool(result),
+            category_l1_arr=result.get('category_l1_arr', []) if result else [],
+            category_l2_arr=result.get('category_l2_arr', []) if result else [],
+        )
         mark_post_processed(channel, int(msg_id))
         
         if result and result.get('is_event') and result.get('date'):
