@@ -100,7 +100,10 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
                 data['category_l1_arr'] = [x for x in data.get('category_l1_arr', []) if x in valid_l1]
             if data and not data.get('category_l1_arr'):
                 data['is_event'] = False
-            logging.info(f"{'Cerebras' if attempt == 0 else 'Groq'}: {data}")
+            model_used = f"{'cerebras' if attempt == 0 else 'groq'}/{model}"
+            if data:
+                data['model'] = model_used
+            logging.info(f"{model_used}: {data}")
             return data
             
         except json.JSONDecodeError as e:
