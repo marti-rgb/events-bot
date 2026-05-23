@@ -103,3 +103,19 @@ def save_event(event: dict) -> bool:
         logging.error(f"save_event error: {e}")
         conn.close()
         return False
+
+def log_parse(channel: str, post_id: str, model: str, fallback: bool, success: bool, error: str = None, category_l1_arr: list = [], category_l2_arr: list = []):
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute('''
+            INSERT INTO parse_logs (channel, post_id, model, fallback, success, error, category_l1_arr, category_l2_arr)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ''', (channel, post_id, model, fallback, success, error,
+              json.dumps(category_l1_arr, ensure_ascii=False),
+              json.dumps(category_l2_arr, ensure_ascii=False)))
+        conn.commit()
+    except Exception as e:
+        logging.error(f"log_parse error: {e}")
+    finally:
+        conn.close()
