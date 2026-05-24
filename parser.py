@@ -171,6 +171,14 @@ async def run_parser():
             total_error += error
             logging.info(f"@{channel}: получено {fetched}, обработано {processed}, сохранено {saved}")
             await asyncio.sleep(2)
-    
-    logging.info(f"Готово. Обработано: {total_processed}, сохранено: {total_saved}")
+    if session_id:
+        finish_parse_session(session_id, {
+            'fetched': total_fetched,
+            'processed': total_processed,
+            'saved': total_saved,
+            'skipped': total_skipped,
+            'error': total_error,
+            'channels': len(CHANNELS)
+        })
+    logging.info(f"Готово. Получено: {total_fetched}, обработано: {total_processed}, сохранено: {total_saved}")
     return total_processed, total_saved
