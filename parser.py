@@ -137,7 +137,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
         
         await asyncio.sleep(1.5)
     
-    return processed, saved
+    return fetched, processed, saved, skipped, error
 
 async def run_parser():
     logging.info("Начинаем парсинг через t.me/s/...")
