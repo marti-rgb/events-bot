@@ -6,6 +6,7 @@ from analyzer import analyze_post
 from database import log_parse, start_parse_session, finish_parse_session
 from database import is_post_processed, mark_post_processed, save_event
 from sheets_config import load_channels, load_keywords, load_categories, match_category_l2, load_stop_tags, UNAVAILABLE_CHANNELS
+import os
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
