@@ -140,8 +140,15 @@ async def run_parser():
     
     logging.info(f"Каналов: {len(CHANNELS)}, ключевых слов: {len(FILTER_KEYWORDS)}")
     
+    total_fetched = 0
     total_processed = 0
     total_saved = 0
+    total_skipped = 0
+    total_error = 0
+
+    github_run_id = os.environ.get('GITHUB_RUN_ID')
+    github_run_url = f"https://github.com/marti-rgb/events-bot/actions/runs/{github_run_id}" if github_run_id else None
+    session_id = start_parse_session(github_run_id, github_run_url)
     
     async with httpx.AsyncClient() as client:
         for channel_config in CHANNELS:
