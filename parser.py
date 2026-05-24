@@ -55,13 +55,16 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
     exclude_ids = [str(i) for i in channel_config.get('exclude_threads', [])]
     whitelist_ids = [str(i) for i in (channel_config.get('threads') or [])]
     
+    fetched = 0
     saved = 0
     processed = 0
-    
+    skipped = 0
+    error = 0
+
     posts = await fetch_channel_posts(client, channel)
-    
     if not posts:
-        return 0, 0
+        return 0, 0, 0, 0, 0
+    fetched = len(posts)
     
     for post in posts:
         msg_id = post['id']
