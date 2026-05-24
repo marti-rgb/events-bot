@@ -163,10 +163,13 @@ async def run_parser():
         for channel_config in CHANNELS:
             channel = channel_config['channel']
             logging.info(f"Парсим @{channel}...")
-            processed, saved = await parse_channel(client, channel_config, FILTER_KEYWORDS, CATEGORIES, STOP_TAGS)
+            fetched, processed, saved, skipped, error = await parse_channel(client, channel_config, FILTER_KEYWORDS, CATEGORIES, STOP_TAGS)
+            total_fetched += fetched
             total_processed += processed
             total_saved += saved
-            logging.info(f"@{channel}: обработано {processed}, сохранено {saved}")
+            total_skipped += skipped
+            total_error += error
+            logging.info(f"@{channel}: получено {fetched}, обработано {processed}, сохранено {saved}")
             await asyncio.sleep(2)
     
     logging.info(f"Готово. Обработано: {total_processed}, сохранено: {total_saved}")
