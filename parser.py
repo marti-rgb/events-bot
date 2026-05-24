@@ -109,6 +109,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 'category_l2': match_category_l2(result.get('category_l2', ''), categories, result.get('category_l1', '')),
                 'description': result.get('description'),
                 'location': result.get('location'),
+                'city_parsed': result.get('city_parsed'),
                 'address': result.get('address'),
                 'price': result.get('price'),
                 'source_url': post['url'],
