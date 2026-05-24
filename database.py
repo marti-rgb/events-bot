@@ -92,8 +92,8 @@ def save_event(event: dict) -> bool:
         event['category_l1_arr'] = json.dumps(event.get('category_l1_arr', []), ensure_ascii=False)
         event['category_l2_arr'] = json.dumps(event.get('category_l2_arr', []), ensure_ascii=False)
         c.execute('''
-            INSERT INTO events (title, date, time, is_free, for_children, format, category_l1, category_l2, category_l1_arr, category_l2_arr, description, location, address, price, source_url, channel, city, model)
-            VALUES (%(title)s, %(date)s, %(time)s, %(is_free)s, %(for_children)s, %(format)s, %(category_l1)s, %(category_l2)s, %(category_l1_arr)s, %(category_l2_arr)s, %(description)s, %(location)s, %(address)s, %(price)s, %(source_url)s, %(channel)s, %(city)s, %(model)s)
+            INSERT INTO events (title, date, time, is_free, for_children, format, category_l1, category_l2, category_l1_arr, category_l2_arr, description, location, address, price, source_url, channel, city, model, city_parsed)
+            VALUES (%(title)s, %(date)s, %(time)s, %(is_free)s, %(for_children)s, %(format)s, %(category_l1)s, %(category_l2)s, %(category_l1_arr)s, %(category_l2_arr)s, %(description)s, %(location)s, %(address)s, %(price)s, %(source_url)s, %(channel)s, %(city)s, %(model)s, %(city_parsed)s)
             ON CONFLICT (source_url) DO NOTHING
         ''', event)
         conn.commit()
