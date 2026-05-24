@@ -119,3 +119,52 @@ def log_parse(channel: str, post_id: str, model: str, fallback: bool, success: b
         logging.error(f"log_parse error: {e}")
     finally:
         conn.close()
+def start_parse_session(github_run_id: str = None, github_run_url: str = None) -> int:
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute('''
+            INSERT INTO parse_sessions (github_run_id, github_run_url)
+            VALUES (%s, %s) RETURNING id
+        ''', (github_run_id, github_run_url))
+        session_id = c.fetchone()['id']
+        conn.commit()
+        return session_id
+    except Exception as e:
+        logging.error(f"start_parse_session error: {e}")
+        return None
+    finally:
+        conn.close()
+
+def finish_parse_session(session_id: int, stats: dict):
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute('SELECT COUNT(*) as cnt FROM events', )
+        total = c.fetchone()['cnt']
+        c.execute('''
+            UPDATE parse_sessions SET
+                session_end = now(),
+                posts_fetched = %s,
+                posts_processed = %s,
+                posts_saved = %s,
+                posts_skipped = %s,
+                posts_error = %s,
+                channels_processed = %s,
+                total_events_in_db = %s
+            WHERE id = %s
+        ''', (
+            stats.get('fetched', 0),
+            stats.get('processed', 0),
+            stats.get('saved', 0),
+            stats.get('skipped', 0),
+            stats.get('error', 0),
+            stats.get('channels', 0),
+            total,
+            session_id
+        ))
+        conn.commit()
+    except Exception as e:
+        logging.error(f"finish_parse_session error: {e}")
+    finally:
+        conn.close()
