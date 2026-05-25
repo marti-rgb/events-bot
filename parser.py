@@ -88,10 +88,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             mark_post_processed(channel, int(msg_id))
             continue
 
-        skipped += 1
-            mark_post_processed(channel, int(msg_id))
-            continue
-        
+       
         processed += 1
         result = await analyze_post(post['text'], post.get('post_date', ''), categories)
         if not result:
