@@ -69,9 +69,9 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
 
     for attempt, (client, model) in enumerate([
         (cerebras_client, "gpt-oss-120b"),
-        (groq_client, "gpt-oss-120b")
-    ]):
-        
+        (groq_client, "llama-3.3-70b-versatile"),
+        (groq_client, "llama-3.1-8b-instant"),
+    ]):        
         if client is None:
             continue
         try:
