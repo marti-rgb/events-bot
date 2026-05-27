@@ -116,6 +116,9 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
             continue
         except Exception as e:
             logging.error(f"API error ({'Cerebras' if attempt == 0 else 'Groq'}): {e}")
+            if attempt == 0 and '429' in str(e):
+                import time
+                time.sleep(5)
+                continue
             continue
-
     return None
