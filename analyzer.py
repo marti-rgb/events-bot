@@ -118,10 +118,16 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
             logging.warning(f"JSON parse error: {e}")
             continue
         except Exception as e:
-            logging.error(f"API error ({'Cerebras' if attempt == 0 else 'Groq'}): {e}")
-            if attempt == 0 and '429' in str(e):
+            provider = 'cerebras' if client == cerebras_client else 'groq'
+            model_used = f"{provider}/{model}"
+            logging.error(f"API error {model_used}: {e}")
+            log_parse_attempt(
+                model=model_used,
+                success=False,
+                error=str(e)[:500]
+            )
+            if '429' in str(e):
                 import time
                 time.sleep(13)
-                continue
             continue
     return None
