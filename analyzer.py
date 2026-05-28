@@ -1,6 +1,7 @@
 import os
 import json
 import logging
+from database import log_parse
 from openai import OpenAI
 
 cerebras_client = OpenAI(
@@ -121,8 +122,11 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
             provider = 'cerebras' if client == cerebras_client else 'groq'
             model_used = f"{provider}/{model}"
             logging.error(f"API error {model_used}: {e}")
-            log_parse_attempt(
+            log_parse(
+                channel='',
+                post_id='',
                 model=model_used,
+                fallback=provider == 'groq',
                 success=False,
                 error=str(e)[:500]
             )
