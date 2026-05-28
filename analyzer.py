@@ -89,7 +89,10 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
                 temperature=0.1,
                 max_tokens=2000,
             )
-            raw = response.choices[0].message.content.strip()
+            raw = response.choices[0].message.content
+            if not raw:
+                continue
+            raw = raw.strip()
 
             if raw.startswith('```'):
                 raw = raw.split('```')[1]
