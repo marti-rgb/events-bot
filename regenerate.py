@@ -8,10 +8,17 @@ from sheets_config import load_categories
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-DB_URL = os.getenv('DATABASE_URL')
+# DB_URL = os.getenv('DATABASE_URL')
 
 def get_connection():
-    return psycopg2.connect(DB_URL)
+    return psycopg2.connect(
+        host="aws-1-eu-central-1.pooler.supabase.com",
+        port=5432,
+        dbname="postgres",
+        user="postgres.phkwivzwzcowgnpnlxre",
+        password=os.environ.get("DB_PASSWORD"),
+        connect_timeout=10
+    )
 
 def get_events_to_regenerate(conn):
     with conn.cursor() as cur:
