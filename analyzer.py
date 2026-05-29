@@ -30,7 +30,7 @@ JSON-структура:
   "time": "HH:MM или null",
   "is_free": true/false/null,
   "price": "стоимость текстом или null",
-  "for_children": true/false,
+  "for_children": true/false/null,
   "format": "offline/online/unknown",
   "location": "название места проведения или null",
   "city_parsed": ["город1", "город2"] или [],
