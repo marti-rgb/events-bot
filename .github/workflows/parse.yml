@@ -3,7 +3,8 @@ name: Parse Events
 on:
   schedule:
     # - cron: '0 5,11,17 * * *'
-    - cron: '0 22 * * *'
+    # - cron: '0 22 * * *'
+    - cron: '0 1 * * *'
   workflow_dispatch:
 
 jobs:
