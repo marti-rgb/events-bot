@@ -2,7 +2,7 @@ import asyncio
 import logging
 import httpx
 from bs4 import BeautifulSoup
-from analyzer import analyze_post
+from analyzer import analyze_post, pre_check_post
 from database import log_parse, start_parse_session, finish_parse_session
 from database import is_post_processed, mark_post_processed, save_event
 from sheets_config import load_channels, load_keywords, load_categories, match_category_l2, load_stop_tags, UNAVAILABLE_CHANNELS
@@ -84,6 +84,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             if not any(kw.lower() in text_lower for kw in filter_keywords):
                 mark_post_processed(channel, int(msg_id))
                 continue
+
         if stop_tags and any(tag in post['text'].lower() for tag in stop_tags):
             mark_post_processed(channel, int(msg_id))
             continue
@@ -94,7 +95,12 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             skipped += 1
             continue
 
-       
+        is_event = await pre_check_post(post['text'])
+        if not is_event:
+            mark_post_processed(channel, int(msg_id))
+            skipped += 1
+            continue
+
         processed += 1
         result = await analyze_post(post['text'], post.get('post_date', ''), categories)
         if not result:
@@ -127,7 +133,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 'channel': channel,
                 'city': channel_config.get('city', 'Москва'),
                 'category_l1_arr': result.get('category_l1_arr', []),
-               'category_l2_arr': result.get('category_l2_arr', []),
+                'category_l2_arr': result.get('category_l2_arr', []),
                 'model': result.get('model'),
             }
             if save_event(event):
@@ -173,6 +179,7 @@ async def run_parser():
             total_error += error
             logging.info(f"@{channel}: получено {fetched}, обработано {processed}, сохранено {saved}")
             await asyncio.sleep(2)
+
     if session_id:
         finish_parse_session(session_id, {
             'fetched': total_fetched,
