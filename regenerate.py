@@ -26,7 +26,7 @@ def get_events_to_regenerate(conn):
             SELECT id, title, description, date, source_url
             FROM events
             WHERE (model IS NULL OR model = 'groq/llama-3.1-8b-instant')
-            AND date >= CURRENT_DATE
+            AND date >= CURRENT_DATE::text
             ORDER BY date ASC
         """)
         return cur.fetchall()
