@@ -169,3 +169,18 @@ def finish_parse_session(session_id: int, stats: dict):
         logging.error(f"finish_parse_session error: {e}")
     finally:
         conn.close()
+
+def has_session_today() -> bool:
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute('''
+            SELECT COUNT(*) as cnt FROM parse_sessions
+            WHERE session_start::date = CURRENT_DATE
+        ''')
+        return c.fetchone()['cnt'] > 0
+    except Exception as e:
+        logging.error(f"has_session_today error: {e}")
+        return False
+    finally:
+        conn.close()
