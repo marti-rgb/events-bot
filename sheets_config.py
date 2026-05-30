@@ -32,6 +32,8 @@ def load_channels() -> list[dict]:
             if not channel:
                 continue
             city = row[city_idx].strip() if city_idx and len(row) > city_idx else 'Москва'
+
+            status_idx = header.index('статус') if 'статус' in header else None
             channels.append({
                 'channel': channel,
                 'city': city,
