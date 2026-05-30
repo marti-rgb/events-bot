@@ -105,3 +105,33 @@ def load_stop_tags() -> list[str]:
     except Exception as e:
         logging.error(f"Ошибка загрузки стоп-тегов: {e}")
         return []
+
+def load_user_channels() -> list[dict]:
+    import psycopg2
+    import os
+    try:
+        conn = psycopg2.connect(
+            host="aws-1-eu-central-1.pooler.supabase.com",
+            port=5432, dbname="postgres",
+            user="postgres.phkwivzwzcowgnpnlxre",
+            password=os.environ.get("DB_PASSWORD"),
+            connect_timeout=10
+        )
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT channel, city FROM user_channels WHERE channel IS NOT NULL")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        result = []
+        for channel, city in rows:
+            result.append({
+                'channel': channel.strip().lstrip('@'),
+                'city': city or 'Москва',
+                'threads': None,
+                'exclude_threads': [],
+            })
+        logging.info(f"Загружено пользовательских каналов: {len(result)}")
+        return result
+    except Exception as e:
+        logging.error(f"Ошибка загрузки user_channels: {e}")
+        return []
