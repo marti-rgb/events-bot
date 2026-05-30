@@ -34,6 +34,9 @@ def load_channels() -> list[dict]:
             city = row[city_idx].strip() if city_idx and len(row) > city_idx else 'Москва'
 
             status_idx = header.index('статус') if 'статус' in header else None
+            status = row[status_idx].strip().lower() if status_idx is not None and len(row) > status_idx else 'активный'
+            if status != 'активный':
+                continue
             channels.append({
                 'channel': channel,
                 'city': city,
