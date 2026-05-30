@@ -150,7 +150,14 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
 async def run_parser():
     logging.info("Начинаем парсинг через t.me/s/...")
     
+    from sheets_config import load_user_channels
     CHANNELS = load_channels()
+    user_channels = load_user_channels()
+    sheets_channel_names = {c['channel'].lower() for c in CHANNELS}
+    for uc in user_channels:
+        if uc['channel'].lower() not in sheets_channel_names:
+            CHANNELS.append(uc)
+    logging.info(f"Итого каналов после merge: {len(CHANNELS)}")
     FILTER_KEYWORDS = load_keywords()
     CATEGORIES = load_categories()
     STOP_TAGS = load_stop_tags()
