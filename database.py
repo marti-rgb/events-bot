@@ -91,6 +91,7 @@ def save_event(event: dict) -> bool:
         logging.info(f"saving arr: {event.get('category_l1_arr')} / {event.get('category_l2_arr')}")
         event['category_l1_arr'] = json.dumps(event.get('category_l1_arr', []), ensure_ascii=False)
         event['category_l2_arr'] = json.dumps(event.get('category_l2_arr', []), ensure_ascii=False)
+        event['city_parsed'] = json.dumps(event.get('city_parsed', []), ensure_ascii=False)
         c.execute('''
             INSERT INTO events (title, date, time, is_free, for_children, format, category_l1_arr, category_l2_arr, description, location, address, price, source_url, channel, city, model, city_parsed)
             VALUES (%(title)s, %(date)s, %(time)s, %(is_free)s, %(for_children)s, %(format)s, %(category_l1_arr)s, %(category_l2_arr)s, %(description)s, %(location)s, %(address)s, %(price)s, %(source_url)s, %(channel)s, %(city)s, %(model)s, %(city_parsed)s)
