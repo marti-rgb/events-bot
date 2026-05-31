@@ -1,5 +1,7 @@
 import httpx
 import logging
+import csv
+import io
 
 SPREADSHEET_ID = '1x8lh3JgDgR3hnhJH2N6DKbpGhN4MQv8QS6EOHPz9Ctk'
 
@@ -7,13 +9,8 @@ def get_sheet_csv(sheet_name: str) -> list[list[str]]:
     url = f'https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq?tqx=out:csv&sheet={sheet_name}'
     response = httpx.get(url, timeout=15)
     response.raise_for_status()
-    lines = response.text.strip().splitlines()
-    rows = []
-    for line in lines:
-        # Простой CSV парсинг (убираем кавычки)
-        cols = [c.strip().strip('"') for c in line.split(',')]
-        rows.append(cols)
-    return rows
+    reader = csv.reader(io.StringIO(response.text))
+    return [row for row in reader]
 
 def load_channels() -> list[dict]:
     try:
