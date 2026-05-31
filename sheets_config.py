@@ -11,7 +11,6 @@ def get_sheet_csv(sheet_name: str) -> list[list[str]]:
     response.raise_for_status()
     reader = csv.reader(io.StringIO(response.text))
     return [row for row in reader]
-
 def load_channels() -> list[dict]:
     try:
         rows = get_sheet_csv('Каналы')
