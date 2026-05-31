@@ -108,3 +108,5 @@ def load_stop_tags() -> list[str]:
         logging.error(f"Ошибка загрузки стоп-тегов: {e}")
         return []
 
+
+
