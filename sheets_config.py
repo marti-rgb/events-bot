@@ -18,6 +18,7 @@ def load_channels() -> list[dict]:
         if not rows:
             return []
         header = [h.lower() for h in rows[0]]
+        logging.info(f"Заголовки листа Каналы: {header}")
         channel_idx = header.index('channel')
         city_idx = header.index('город') if 'город' in header else None
         
