@@ -2,7 +2,7 @@ import asyncio
 import logging
 import httpx
 from bs4 import BeautifulSoup
-from analyzer import analyze_post, pre_check_post
+from analyzer import analyze_post, screen_post
 from database import log_parse, start_parse_session, finish_parse_session
 from database import is_post_processed, mark_post_processed, save_event
 from sheets_config import load_channels, load_keywords, load_categories, match_category_l2, load_stop_tags, UNAVAILABLE_CHANNELS
@@ -95,7 +95,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             skipped += 1
             continue
 
-        is_event = await pre_check_post(post['text'])
+        is_event = await screen_post(post['text'])
         log_parse(
             channel=channel,
             post_id=str(msg_id),
