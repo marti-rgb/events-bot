@@ -96,6 +96,14 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             continue
 
         is_event = await pre_check_post(post['text'])
+        log_parse(
+            channel=channel,
+            post_id=str(msg_id),
+            model='groq/llama-3.1-8b-instant',
+            fallback=True,
+            success=True,
+            stage='screen',
+        )
         if not is_event:
             mark_post_processed(channel, int(msg_id))
             skipped += 1
@@ -113,6 +121,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             success=bool(result),
             category_l1_arr=result.get('category_l1_arr', []) if result else [],
             category_l2_arr=result.get('category_l2_arr', []) if result else [],
+            stage='analyze',
         )
         mark_post_processed(channel, int(msg_id))
         
