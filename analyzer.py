@@ -16,23 +16,6 @@ try:
 except:
     pass
 
-PRE_CHECK_PROMPT = "Это анонс мероприятия (концерт, выставка, спектакль, лекция, мастер-класс и т.д.)? Ответь только: да или нет.\n\n{text}"
-
-async def pre_check_post(text: str) -> bool:
-    if groq_client is None:
-        return True
-    try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": PRE_CHECK_PROMPT.format(text=text[:500])}],
-            temperature=0,
-            max_tokens=5,
-        )
-        answer = response.choices[0].message.content.strip().lower()
-        return answer.startswith('да')
-    except Exception:
-        return True
-
 PROMPT_TEMPLATE = """Проанализируй пост из Telegram-канала. Верни ТОЛЬКО валидный JSON без markdown, без пояснений.
 Дата публикации поста: {post_date}
 Пост:
