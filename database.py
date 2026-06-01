@@ -105,7 +105,7 @@ def save_event(event: dict) -> bool:
         conn.close()
         return False
 
-def log_parse(channel: str, post_id: str, model: str, fallback: bool, success: bool, error: str = None, category_l1_arr: list = [], category_l2_arr: list = []):
+ddef log_parse(channel: str, post_id: str, model: str, fallback: bool, success: bool, error: str = None, category_l1_arr: list = [], category_l2_arr: list = []):
     conn = get_conn()
     c = conn.cursor()
     try:
