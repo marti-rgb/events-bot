@@ -79,6 +79,46 @@ JSON-структура:
 - is_event = false если пост описывает прошедшее мероприятие
 - is_event = false если пост является расписанием, заголовком, афишей без конкретного описания мероприятия"""
 
+SCREEN_PROMPT = """Определи: является ли этот пост анонсом конкретного предстоящего мероприятия с датой?
+
+Пост:
+{text}
+
+Не является мероприятием:
+- скидки, акции, распродажи, поступление товара, новинки
+- прошедшие события
+- расписание или афиша без описания конкретного события
+- пост содержит несколько разных мероприятий без описания одного
+- нет конкретной даты проведения
+
+Ответь ТОЛЬКО валидным JSON без пояснений:
+{{"is_event": true}} или {{"is_event": false}}"""
+
+async def screen_post(text: str) -> bool:
+    if not text or len(text.strip()) < 20:
+        return False
+    prompt = SCREEN_PROMPT.format(text=text[:2000])
+    if groq_client is None:
+        return True
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=20,
+        )
+        raw = response.choices[0].message.content.strip()
+        if raw.startswith('```'):
+            raw = raw.split('```')[1]
+            if raw.startswith('json'):
+                raw = raw[4:]
+        data = json.loads(raw.strip())
+        return bool(data.get('is_event', True))
+    except Exception as e:
+        logging.warning(f"screen_post error: {e}")
+        return True
+
+
 async def analyze_post(text: str, post_date: str = '', categories: dict = {}) -> dict | None:
     if not text or len(text.strip()) < 20:
         return None
