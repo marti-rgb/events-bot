@@ -68,7 +68,7 @@ def fix_title(title, description):
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.2,
-                max_tokens=100
+                max_tokens=500
             )
             logging.info(f"[{model}] raw response: {response}")
             content = response.choices[0].message.content
