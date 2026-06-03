@@ -70,10 +70,15 @@ def fix_title(title, description):
                 temperature=0.2,
                 max_tokens=100
             )
-            result = response.choices[0].message.content.strip()
-            if result and len(result) > 5:
+            logging.info(f"[{model}] raw response: {response}")
+            content = response.choices[0].message.content
+            logging.info(f"[{model}] content: {repr(content)}")
+            if content and content.strip() and len(content.strip()) > 5:
+                result = content.strip()
                 logging.info(f"[{model}] '{title}' → '{result}'")
                 return result
+            else:
+                logging.warning(f"[{model}] пустой или короткий ответ: {repr(content)}")
         except Exception as e:
             logging.warning(f"[{model}] ошибка: {e}")
             continue
@@ -101,7 +106,8 @@ def main():
     success = 0
     failed = 0
 
-    for i, event in enumerate(events):
+    # for i, event in enumerate(events):
+    for i, event in enumerate(events[:5]):
         event_id = event['id']
         old_title = event['title']
         description = event.get('description', '')
