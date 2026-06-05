@@ -96,34 +96,29 @@ def save_event(event: dict) -> bool:
             INSERT INTO events (title, date, time, is_free, for_children, format, category_l1_arr, category_l2_arr, description, location, address, price, source_url, channel, city, model, city_parsed)
             VALUES (%(title)s, %(date)s, %(time)s, %(is_free)s, %(for_children)s, %(format)s, %(category_l1_arr)s, %(category_l2_arr)s, %(description)s, %(location)s, %(address)s, %(price)s, %(source_url)s, %(channel)s, %(city)s, %(model)s, %(city_parsed)s)
             ON CONFLICT (source_url) DO NOTHING
-        ON CONFLICT (source_url) DO NOTHING
             RETURNING id
         ''', event)
-                
-                # Проверка дубликата по описанию
-                new_id = c.fetchone()
-                if new_id and event.get('description'):
-                    new_id = new_id['id']
-                    c.execute('''
-                        SELECT id FROM events 
-                        WHERE date = %s 
-                        AND description IS NOT NULL
-                        AND similarity(description, %s) > 0.95
-                        AND id != %s
-                        LIMIT 1
-                    ''', (event.get('date'), event.get('description'), new_id))
-                    duplicate = c.fetchone()
-                    if duplicate:
-                        c.execute('''
-                            UPDATE events SET is_ignored = true, ignored_reason = 'duplicate'
-                            WHERE id = %s
-                        ''', (new_id,))
-                        conn.commit()
-                        logging.info(f"Дубликат помечен: id={new_id}, оригинал id={duplicate['id']}")
-                
-                conn.close()
-                return True
- 
+        row = c.fetchone()
+        if row and event.get('description'):
+            new_id = row['id']
+            c.execute('''
+                SELECT id FROM events 
+                WHERE date = %s 
+                AND description IS NOT NULL
+                AND similarity(description, %s) > 0.95
+                AND id != %s
+                LIMIT 1
+            ''', (event.get('date'), event.get('description'), new_id))
+            duplicate = c.fetchone()
+            if duplicate:
+                c.execute('''
+                    UPDATE events SET is_ignored = true, ignored_reason = 'duplicate'
+                    WHERE id = %s
+                ''', (new_id,))
+                logging.info(f"Дубликат помечен: id={new_id}, оригинал id={duplicate['id']}")
+        conn.commit()
+        conn.close()
+        return True
     except Exception as e:
         logging.error(f"save_event error: {e}")
         conn.close()
