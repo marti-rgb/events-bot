@@ -1,4 +1,3 @@
-# ВЕРСИЯ v41 — 26.08.2026 (вместе с analyzer.py и parser.py той же версии)
 name: Parse Events
 on:
   schedule:
