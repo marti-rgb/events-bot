@@ -1,3 +1,11 @@
+# ВЕРСИЯ v41 — 26.08.2026
+# Изменено относительно v40: Cerebras отключён, первый провайдер Z.ai (glm-4.5-flash),
+# запасные — Groq openai/gpt-oss-120b и openai/gpt-oss-20b; переключатель размышлений;
+# 429 без длинной паузы; правки промпта (цена, дата, диапазон дат);
+# честный лог первой линии; листание истории каналов; деление каналов на части;
+# первая линия отключаема (USE_SCREEN).
+# Переменные в GitHub → Settings → Variables:
+#   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
 import os
 import json
 import time

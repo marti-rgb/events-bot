@@ -1,3 +1,11 @@
+# ВЕРСИЯ v41 — 26.08.2026
+# Изменено относительно v40: Cerebras отключён, первый провайдер Z.ai (glm-4.5-flash),
+# запасные — Groq openai/gpt-oss-120b и openai/gpt-oss-20b; переключатель размышлений;
+# 429 без длинной паузы; правки промпта (цена, дата, диапазон дат);
+# честный лог первой линии; листание истории каналов; деление каналов на части;
+# первая линия отключаема (USE_SCREEN).
+# Переменные в GitHub → Settings → Variables:
+#   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
 import asyncio
 import logging
 import httpx
@@ -18,6 +26,12 @@ try:
     PARSE_PAGES = max(1, min(int(os.getenv('PARSE_PAGES', '1') or 1), 20))
 except ValueError:
     PARSE_PAGES = 1
+
+# Первая линия (быстрая проверка "событие / не событие" перед разбором).
+# У Z.ai короткий ответ стоит столько же времени, сколько полный разбор,
+# поэтому по умолчанию выключена — разбор сам отсеивает не-события.
+# Включается переменной USE_SCREEN=1 в GitHub → Settings → Variables.
+USE_SCREEN = (os.getenv('USE_SCREEN', '0') or '0').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 async def fetch_channel_posts(client: httpx.AsyncClient, channel: str, pages: int = None) -> list[dict]:
@@ -137,19 +151,20 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             skipped += 1
             continue
 
-        is_event, screen_model = await screen_post(post['text'])
-        log_parse(
-            channel=channel,
-            post_id=str(msg_id),
-            model=screen_model or 'none',
-            fallback=bool(screen_model and not screen_model.startswith('zai/')),
-            success=screen_model is not None,
-            stage='screen',
-        )
-        if not is_event:
-            mark_post_processed(channel, int(msg_id))
-            skipped += 1
-            continue
+        if USE_SCREEN:
+            is_event, screen_model = await screen_post(post['text'])
+            log_parse(
+                channel=channel,
+                post_id=str(msg_id),
+                model=screen_model or 'none',
+                fallback=bool(screen_model and not screen_model.startswith('zai/')),
+                success=screen_model is not None,
+                stage='screen',
+            )
+            if not is_event:
+                mark_post_processed(channel, int(msg_id))
+                skipped += 1
+                continue
 
         processed += 1
         result = await analyze_post(post['text'], post.get('post_date', ''), categories)
@@ -202,6 +217,21 @@ async def run_parser():
     logging.info("Начинаем парсинг через t.me/s/...")
     
     CHANNELS = load_channels()
+
+    # Обработать только часть списка каналов. Формат "N/M", например "2/5" —
+    # вторая пятая часть. Пусто или "1/1" — все каналы (обычный режим).
+    # Управляется переменной CHANNELS_PART в GitHub → Settings → Variables.
+    part = (os.getenv('CHANNELS_PART') or '').strip()
+    if part and '/' in part:
+        try:
+            n_str, m_str = part.split('/', 1)
+            n, m = int(n_str), int(m_str)
+            if m > 1 and 1 <= n <= m:
+                total = len(CHANNELS)
+                CHANNELS = CHANNELS[(n - 1) * total // m: n * total // m]
+                logging.info(f"Часть {n} из {m}: берём {len(CHANNELS)} каналов из {total}")
+        except ValueError:
+            logging.warning(f"CHANNELS_PART='{part}' — не понял формат, беру все каналы")
 
     FILTER_KEYWORDS = load_keywords()
     CATEGORIES = load_categories()
