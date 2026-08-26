@@ -12,8 +12,50 @@ HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 }
 
-async def fetch_channel_posts(client: httpx.AsyncClient, channel: str) -> list[dict]:
-    url = f'https://t.me/s/{channel}'
+# Сколько страниц истории канала листать назад. 1 страница ≈ 20 постов.
+# Управляется переменной PARSE_PAGES в GitHub → Settings → Variables.
+try:
+    PARSE_PAGES = max(1, min(int(os.getenv('PARSE_PAGES', '1') or 1), 20))
+except ValueError:
+    PARSE_PAGES = 1
+
+
+async def fetch_channel_posts(client: httpx.AsyncClient, channel: str, pages: int = None) -> list[dict]:
+    pages = PARSE_PAGES if pages is None else max(1, pages)
+    all_posts = []
+    seen_ids = set()
+    before = None
+
+    for page in range(pages):
+        url = f'https://t.me/s/{channel}'
+        if before:
+            url += f'?before={before}'
+
+        page_posts = await _fetch_one_page(client, channel, url)
+        if not page_posts:
+            break
+
+        new_posts = [p for p in page_posts if p['id'] not in seen_ids]
+        if not new_posts:
+            break
+
+        for p in new_posts:
+            seen_ids.add(p['id'])
+        all_posts.extend(new_posts)
+
+        try:
+            before = min(int(p['id']) for p in new_posts)
+        except ValueError:
+            break
+        if before <= 1:
+            break
+
+    if pages > 1:
+        logging.info(f"@{channel}: собрано {len(all_posts)} постов за {pages} стр.")
+    return all_posts
+
+
+async def _fetch_one_page(client: httpx.AsyncClient, channel: str, url: str) -> list[dict]:
     try:
         response = await client.get(url, headers=HEADERS, timeout=15)
         if response.status_code != 200:
@@ -95,13 +137,13 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             skipped += 1
             continue
 
-        is_event = await screen_post(post['text'])
+        is_event, screen_model = await screen_post(post['text'])
         log_parse(
             channel=channel,
             post_id=str(msg_id),
-            model='groq/llama-3.1-8b-instant',
-            fallback=True,
-            success=True,
+            model=screen_model or 'none',
+            fallback=bool(screen_model and not screen_model.startswith('zai/')),
+            success=screen_model is not None,
             stage='screen',
         )
         if not is_event:
