@@ -4,6 +4,19 @@ on:
     - cron: '0 1 * * *'
     - cron: '0 2 * * *'
   workflow_dispatch:
+    inputs:
+      thinking:
+        description: 'Размышления на второй линии'
+        type: choice
+        default: 'как настроено'
+        options:
+          - 'как настроено'
+          - 'включить'
+          - 'выключить'
+      pages:
+        description: 'Глубина истории каналов (1 стр. ≈ 20 постов)'
+        type: string
+        default: ''
 jobs:
   parse:
     runs-on: ubuntu-latest
@@ -24,6 +37,9 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          PARSE_PAGES: ${{ inputs.pages || vars.PARSE_PAGES || '1' }}
+          ANALYZE_THINKING: ${{ inputs.thinking == 'включить' && '1' || (inputs.thinking == 'выключить' && '0' || vars.ANALYZE_THINKING || '0') }}
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           IS_BACKUP_RUN: ${{ github.event.schedule == '0 2 * * *' && '1' || '0' }}
