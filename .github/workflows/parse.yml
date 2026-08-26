@@ -1,3 +1,4 @@
+# ВЕРСИЯ v41 — 26.08.2026 (вместе с analyzer.py и parser.py той же версии)
 name: Parse Events
 on:
   schedule:
@@ -15,6 +16,14 @@ on:
           - 'выключить'
       pages:
         description: 'Глубина истории каналов (1 стр. ≈ 20 постов)'
+        type: string
+        default: ''
+      part:
+        description: 'Часть каналов, например 1/5 (пусто — все)'
+        type: string
+        default: ''
+      part:
+        description: 'Часть списка каналов, формат N/M (пусто = все)'
         type: string
         default: ''
 jobs:
@@ -38,6 +47,9 @@ jobs:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          CHANNELS_PART: ${{ inputs.part || vars.CHANNELS_PART || '' }}
+          CHANNELS_PART: ${{ inputs.part || vars.CHANNELS_PART || '' }}
+          USE_SCREEN: ${{ vars.USE_SCREEN || '0' }}
           PARSE_PAGES: ${{ inputs.pages || vars.PARSE_PAGES || '1' }}
           ANALYZE_THINKING: ${{ inputs.thinking == 'включить' && '1' || (inputs.thinking == 'выключить' && '0' || vars.ANALYZE_THINKING || '0') }}
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
