@@ -1,4 +1,6 @@
-# ВЕРСИЯ v41 — 26.08.2026
+# ВЕРСИЯ v42 — 26.08.2026
+# Изменено относительно v41: фильтр постов по дате публикации (PARSE_SINCE):
+# посты старше указанной даты пропускаются без вызова модели.
 # Изменено относительно v40: Cerebras отключён, первый провайдер Z.ai (glm-4.5-flash),
 # запасные — Groq openai/gpt-oss-120b и openai/gpt-oss-20b; переключатель размышлений;
 # 429 без длинной паузы; правки промпта (цена, дата, диапазон дат);
@@ -6,6 +8,7 @@
 # первая линия отключаема (USE_SCREEN).
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
+#   PARSE_SINCE=(пусто) — нижняя граница по дате публикации поста, ГГГГ-ММ-ДД
 import asyncio
 import logging
 import httpx
@@ -26,6 +29,10 @@ try:
     PARSE_PAGES = max(1, min(int(os.getenv('PARSE_PAGES', '1') or 1), 20))
 except ValueError:
     PARSE_PAGES = 1
+
+# Нижняя граница по дате публикации поста, формат ГГГГ-ММ-ДД.
+# Посты старше пропускаются мгновенно, без вызова модели. Пусто — берём все.
+PARSE_SINCE = (os.getenv('PARSE_SINCE') or '').strip()
 
 # Первая линия (быстрая проверка "событие / не событие" перед разбором).
 # У Z.ai короткий ответ стоит столько же времени, сколько полный разбор,
@@ -130,6 +137,9 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             continue
         
         if msg_id in exclude_ids:
+            continue
+
+        if PARSE_SINCE and post.get('post_date') and post['post_date'] < PARSE_SINCE:
             continue
         
         if is_post_processed(channel, int(msg_id)):
@@ -238,6 +248,8 @@ async def run_parser():
     STOP_TAGS = load_stop_tags()
     
     logging.info(f"Каналов: {len(CHANNELS)}, ключевых слов: {len(FILTER_KEYWORDS)}")
+    if PARSE_SINCE:
+        logging.info(f"Берём только посты от {PARSE_SINCE} и новее")
     
     total_fetched = 0
     total_processed = 0
