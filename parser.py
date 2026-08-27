@@ -1,7 +1,15 @@
-# ВЕРСИЯ v44 — 27.08.2026
-# Изменено относительно v43: закрыта дыра в PARSE_SINCE — раньше пост без
-# определённой даты публикации проходил фильтр насквозь (как будто он новый),
-# теперь при включённом PARSE_SINCE такой пост тоже пропускается.
+# ВЕРСИЯ v47 — 27.08.2026
+# Изменено относительно v46: добавлено логирование ОРИГИНАЛЬНОГО текста поста
+# (не пересказа модели), когда модель сочла его НЕ событием — чтобы искать
+# реальные паттерны для расширения списка ключевых слов/стоп-тегов.
+# Изменено относительно v45: добавлено логирование, когда пост отсеивается
+# стоп-тегом — видно, каким именно тегом и какой текст отсеян, чтобы можно
+# было проверять по факту, не режет ли какой-то стоп-тег настоящие события.
+# Изменено относительно v44: пост помечается обработанным (mark_post_processed)
+# ТОЛЬКО если модель реально вернула результат. Раньше помечался всегда, даже
+# при полном отказе и Z.ai, и Groq одновременно — такой пост терялся навсегда,
+# следующий прогон его больше не трогал. Теперь при полном отказе пост остаётся
+# в очереди и будет предпринята повторная попытка на следующем прогоне.
 # Изменено относительно v41: фильтр постов по дате публикации (PARSE_SINCE):
 # посты старше указанной даты пропускаются без вызова модели.
 # Изменено относительно v42: мягкая остановка по времени (MAX_RUN_MINUTES) —
@@ -167,9 +175,14 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 mark_post_processed(channel, int(msg_id))
                 continue
 
-        if stop_tags and any(tag in post['text'].lower() for tag in stop_tags):
-            mark_post_processed(channel, int(msg_id))
-            continue
+        if stop_tags:
+            text_lower = post['text'].lower()
+            matched = next((tag for tag in stop_tags if tag in text_lower), None)
+            if matched:
+                snippet = post['text'][:150].strip().replace('\n', ' ')
+                logging.info(f"🚫 @{channel}/{msg_id} отсеян стоп-тегом '{matched}': {snippet!r}")
+                mark_post_processed(channel, int(msg_id))
+                continue
 
         link_count = post['text'].lower().count('timepad') + post['text'].lower().count('bilet.mos')
         if link_count >= 3:
@@ -206,8 +219,13 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             category_l2_arr=result.get('category_l2_arr', []) if result else [],
             stage='analyze',
         )
-        mark_post_processed(channel, int(msg_id))
-        
+        if result:
+            mark_post_processed(channel, int(msg_id))
+
+        if result and not result.get('is_event'):
+            snippet = post['text'][:200].strip().replace('\n', ' ')
+            logging.info(f"❌ @{channel}/{msg_id} НЕ событие (оригинал поста): {snippet!r}")
+
         if result and result.get('is_event') and result.get('date'):
             event = {
                 'title': result.get('title'),
