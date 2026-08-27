@@ -47,20 +47,32 @@ SELECT_SQL = """
 """
 
 
-def fetch_real_post_date(client: httpx.Client, source_url: str) -> str | None:
-    """Открывает публичную страницу поста и достаёт настоящую дату публикации."""
-    url = source_url.rstrip('/') + '?embed=1'
+def fetch_real_post_date(client: httpx.Client, channel: str, msg_id: str) -> str | None:
+    """Открывает публичную страницу канала (тот же способ, что использует
+    основной парсер) и достаёт настоящую дату публикации конкретного поста."""
+    url = f'https://t.me/s/{channel}/{msg_id}'
     try:
-        response = client.get(url, headers=HEADERS, timeout=15)
+        response = client.get(url, headers=HEADERS, timeout=15, follow_redirects=True)
         if response.status_code != 200:
+            logging.warning(f"  → {url}: HTTP {response.status_code}")
             return None
+
         soup = BeautifulSoup(response.text, 'html.parser')
-        time_tag = soup.find('time')
-        if not time_tag or not time_tag.get('datetime'):
-            return None
-        return time_tag['datetime'][:10]
+        target = f'{channel}/{msg_id}'
+        messages = soup.find_all('div', class_='tgme_widget_message')
+
+        for msg in messages:
+            if msg.get('data-post', '') == target:
+                time_tag = msg.find('time')
+                if time_tag and time_tag.get('datetime'):
+                    return time_tag['datetime'][:10]
+                logging.warning(f"  → {url}: пост найден, но без даты")
+                return None
+
+        logging.warning(f"  → {url}: пост {target} не найден на странице ({len(messages)} постов на странице)")
+        return None
     except Exception as e:
-        logging.error(f"Ошибка получения {source_url}: {e}")
+        logging.error(f"  → {url}: ошибка {e}")
         return None
 
 
@@ -102,8 +114,10 @@ def main():
             event_id = row['id']
             source_url = row['source_url']
             stored_date = row['date']
+            channel = row['channel']
+            msg_id = source_url.rstrip('/').split('/')[-1]
 
-            real_date = fetch_real_post_date(client, source_url)
+            real_date = fetch_real_post_date(client, channel, msg_id)
             time.sleep(1)
 
             if not real_date:
