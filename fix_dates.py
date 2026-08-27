@@ -49,7 +49,10 @@ SELECT_SQL = """
 
 def fetch_real_post_date(client: httpx.Client, channel: str, msg_id: str) -> str | None:
     """Открывает публичную страницу канала (тот же способ, что использует
-    основной парсер) и достаёт настоящую дату публикации конкретного поста."""
+    основной парсер) и достаёт настоящую дату публикации конкретного поста.
+    Если у самого поста своей даты нет (часть фото-альбома) — берёт дату
+    у ближайшего по номеру поста на той же странице: для определения
+    ГОДА этого достаточно, альбом публикуется одним днём."""
     url = f'https://t.me/s/{channel}/{msg_id}'
     try:
         response = client.get(url, headers=HEADERS, timeout=15, follow_redirects=True)
@@ -58,19 +61,31 @@ def fetch_real_post_date(client: httpx.Client, channel: str, msg_id: str) -> str
             return None
 
         soup = BeautifulSoup(response.text, 'html.parser')
-        target = f'{channel}/{msg_id}'
-        messages = soup.find_all('div', class_='tgme_widget_message')
+        target_id = int(msg_id)
+        candidates = []
+        for msg in soup.find_all('div', class_='tgme_widget_message'):
+            data_post = msg.get('data-post', '')
+            if '/' not in data_post:
+                continue
+            try:
+                this_id = int(data_post.split('/')[-1])
+            except ValueError:
+                continue
+            time_tag = msg.find('time')
+            if time_tag and time_tag.get('datetime'):
+                candidates.append((this_id, time_tag['datetime'][:10]))
 
-        for msg in messages:
-            if msg.get('data-post', '') == target:
-                time_tag = msg.find('time')
-                if time_tag and time_tag.get('datetime'):
-                    return time_tag['datetime'][:10]
-                logging.warning(f"  → {url}: пост найден, но без даты")
-                return None
+        if not candidates:
+            logging.warning(f"  → {url}: на странице нет ни одной даты")
+            return None
 
-        logging.warning(f"  → {url}: пост {target} не найден на странице ({len(messages)} постов на странице)")
-        return None
+        for this_id, date_val in candidates:
+            if this_id == target_id:
+                return date_val
+
+        closest_id, closest_date = min(candidates, key=lambda x: abs(x[0] - target_id))
+        logging.info(f"  → {url}: у поста {target_id} своей даты нет (альбом), взяли соседний {closest_id} → {closest_date}")
+        return closest_date
     except Exception as e:
         logging.error(f"  → {url}: ошибка {e}")
         return None
