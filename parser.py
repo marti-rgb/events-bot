@@ -1,4 +1,7 @@
-# ВЕРСИЯ v43 — 26.08.2026
+# ВЕРСИЯ v44 — 27.08.2026
+# Изменено относительно v43: закрыта дыра в PARSE_SINCE — раньше пост без
+# определённой даты публикации проходил фильтр насквозь (как будто он новый),
+# теперь при включённом PARSE_SINCE такой пост тоже пропускается.
 # Изменено относительно v41: фильтр постов по дате публикации (PARSE_SINCE):
 # посты старше указанной даты пропускаются без вызова модели.
 # Изменено относительно v42: мягкая остановка по времени (MAX_RUN_MINUTES) —
@@ -150,8 +153,10 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
         if msg_id in exclude_ids:
             continue
 
-        if PARSE_SINCE and post.get('post_date') and post['post_date'] < PARSE_SINCE:
-            continue
+        if PARSE_SINCE:
+            post_date_val = post.get('post_date') or ''
+            if not post_date_val or post_date_val < PARSE_SINCE:
+                continue
         
         if is_post_processed(channel, int(msg_id)):
             continue
