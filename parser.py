@@ -1,6 +1,9 @@
-# ВЕРСИЯ v42 — 26.08.2026
+# ВЕРСИЯ v43 — 26.08.2026
 # Изменено относительно v41: фильтр постов по дате публикации (PARSE_SINCE):
 # посты старше указанной даты пропускаются без вызова модели.
+# Изменено относительно v42: мягкая остановка по времени (MAX_RUN_MINUTES) —
+# при подходе к лимиту GitHub Actions прогон завершается сам, зелёной галочкой,
+# а не обрывается по Cancelled.
 # Изменено относительно v40: Cerebras отключён, первый провайдер Z.ai (glm-4.5-flash),
 # запасные — Groq openai/gpt-oss-120b и openai/gpt-oss-20b; переключатель размышлений;
 # 429 без длинной паузы; правки промпта (цена, дата, диапазон дат);
@@ -11,6 +14,7 @@
 #   PARSE_SINCE=(пусто) — нижняя граница по дате публикации поста, ГГГГ-ММ-ДД
 import asyncio
 import logging
+import time
 import httpx
 from bs4 import BeautifulSoup
 from analyzer import analyze_post, screen_post
@@ -33,6 +37,13 @@ except ValueError:
 # Нижняя граница по дате публикации поста, формат ГГГГ-ММ-ДД.
 # Посты старше пропускаются мгновенно, без вызова модели. Пусто — берём все.
 PARSE_SINCE = (os.getenv('PARSE_SINCE') or '').strip()
+
+# Мягкий бюджет времени на весь прогон, в минутах. Как подойдём к границе —
+# останавливаемся сами (зелёная галочка), не дожидаясь принудительной отмены GitHub.
+try:
+    MAX_RUN_MINUTES = int(os.getenv('MAX_RUN_MINUTES', '320') or 320)
+except ValueError:
+    MAX_RUN_MINUTES = 320
 
 # Первая линия (быстрая проверка "событие / не событие" перед разбором).
 # У Z.ai короткий ответ стоит столько же времени, сколько полный разбор,
@@ -261,8 +272,18 @@ async def run_parser():
     github_run_url = f"https://github.com/marti-rgb/events-bot/actions/runs/{github_run_id}" if github_run_id else None
     session_id = start_parse_session(github_run_id, github_run_url)
     
+    run_started = time.monotonic()
     async with httpx.AsyncClient() as client:
-        for channel_config in CHANNELS:
+        for idx, channel_config in enumerate(CHANNELS):
+            elapsed_min = (time.monotonic() - run_started) / 60
+            if elapsed_min > MAX_RUN_MINUTES:
+                left = len(CHANNELS) - idx
+                logging.warning(
+                    f"Мягкая остановка по времени: прошло {elapsed_min:.0f} мин "
+                    f"(лимит {MAX_RUN_MINUTES}). Необработанных каналов: {left} из {len(CHANNELS)}, "
+                    f"первый из них — @{channel_config['channel']}"
+                )
+                break
             channel = channel_config['channel']
             logging.info(f"Парсим @{channel}...")
             fetched, processed, saved, skipped, error = await parse_channel(client, channel_config, FILTER_KEYWORDS, CATEGORIES, STOP_TAGS)
