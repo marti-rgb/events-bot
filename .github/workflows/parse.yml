@@ -1,6 +1,7 @@
 name: Parse Events
-# ВЕРСИЯ v42 — 26.08.2026 (parser.py v42; analyzer.py остаётся v41)
-# Добавлено: поле "since" и переменная PARSE_SINCE — брать посты не старше даты.
+# ВЕРСИЯ v43 — 28.08.2026
+# Добавлено: concurrency-группа (одинаковая часть не запускается параллельно
+# сама с собой), SHEET_ID теперь читается из secrets, а не из кода.
 on:
   schedule:
     - cron: '0 1 * * *'
@@ -31,6 +32,9 @@ jobs:
   parse:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    concurrency:
+      group: parse-${{ inputs.part || 'scheduled' }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
@@ -48,6 +52,7 @@ jobs:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
           CHANNELS_PART: ${{ inputs.part || vars.CHANNELS_PART || '' }}
           USE_SCREEN: ${{ vars.USE_SCREEN || '0' }}
           PARSE_PAGES: ${{ inputs.pages || vars.PARSE_PAGES || '1' }}
