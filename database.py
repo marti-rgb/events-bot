@@ -140,6 +140,23 @@ def log_parse(channel: str, post_id: str, model: str, fallback: bool, success: b
         logging.error(f"log_parse error: {e}")
     finally:
         conn.close()
+def log_rejected_post(channel: str, post_id: str, text: str):
+    """Сохраняет текст поста, который нейросеть сочла НЕ событием —
+    для последующего поиска новых стоп-слов частотным анализом.
+    Никак не влияет на сохранение событий, только на этот побочный лог."""
+    conn = get_conn()
+    c = conn.cursor()
+    try:
+        c.execute('''
+            INSERT INTO rejected_posts (channel, post_id, text)
+            VALUES (%s, %s, %s)
+        ''', (channel, post_id, (text or '')[:2000]))
+        conn.commit()
+    except Exception as e:
+        logging.error(f"log_rejected_post error: {e}")
+    finally:
+        conn.close()
+
 def start_parse_session(github_run_id: str = None, github_run_url: str = None) -> int:
     conn = get_conn()
     c = conn.cursor()

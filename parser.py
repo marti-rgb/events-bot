@@ -1,4 +1,8 @@
-# ВЕРСИЯ v47 — 27.08.2026
+# ВЕРСИЯ v48 — 28.08.2026
+# Изменено относительно v47: текст поста, который нейросеть сочла НЕ событием,
+# теперь дополнительно сохраняется в таблицу rejected_posts (не только в
+# консольный лог) — чтобы искать новые стоп-слова частотным анализом по базе,
+# а не вручную по логам отдельных прогонов.
 # Изменено относительно v46: добавлено логирование ОРИГИНАЛЬНОГО текста поста
 # (не пересказа модели), когда модель сочла его НЕ событием — чтобы искать
 # реальные паттерны для расширения списка ключевых слов/стоп-тегов.
@@ -30,7 +34,7 @@ import httpx
 from bs4 import BeautifulSoup
 from analyzer import analyze_post, screen_post
 from database import log_parse, start_parse_session, finish_parse_session
-from database import is_post_processed, mark_post_processed, save_event
+from database import is_post_processed, mark_post_processed, save_event, log_rejected_post
 from sheets_config import load_channels, load_keywords, load_categories, match_category_l2, load_stop_tags, UNAVAILABLE_CHANNELS
 import os
 
@@ -225,6 +229,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
         if result and not result.get('is_event'):
             snippet = post['text'][:200].strip().replace('\n', ' ')
             logging.info(f"❌ @{channel}/{msg_id} НЕ событие (оригинал поста): {snippet!r}")
+            log_rejected_post(channel, str(msg_id), post['text'])
 
         if result and result.get('is_event') and result.get('date'):
             event = {

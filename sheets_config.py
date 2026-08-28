@@ -1,9 +1,10 @@
+import os
 import httpx
 import logging
 import csv
 import io
 
-SPREADSHEET_ID = '1x8lh3JgDgR3hnhJH2N6DKbpGhN4MQv8QS6EOHPz9Ctk'
+SPREADSHEET_ID = os.getenv('SHEET_ID', '')
 
 def get_sheet_csv(sheet_name: str) -> list[list[str]]:
     url = f'https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq?tqx=out:csv&sheet={sheet_name}'
