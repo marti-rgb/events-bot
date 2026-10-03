@@ -1,3 +1,6 @@
+# database.py — v2 (имя файла не меняется: его импортирует parser.py)
+# v2 — event_exists и проверка похожего описания сравнивают только с видимыми мероприятиями (опубликованы или в очереди queue); черновики, модерация, удалённые, отклонённые и дубликаты больше не прячут мероприятие из канала. Обновлено 03.10.2026
+# v1 — исходная версия
 import os
 import json
 import logging
@@ -76,7 +79,11 @@ def event_exists(title: str, date: str) -> bool:
         return False
     conn = get_conn()
     c = conn.cursor()
-    c.execute('SELECT 1 FROM events WHERE title=%s AND date=%s', (title, date))
+    # patch 1: only visible events (published or queued) block saving; drafts/moderation/deleted/rejected/duplicates don't
+    c.execute('''
+        SELECT 1 FROM events WHERE title=%s AND date=%s
+        AND (COALESCE(is_ignored, false) = false OR ignored_reason = 'queue')
+    ''', (title, date))
     result = c.fetchone()
     conn.close()
     return result is not None
@@ -107,6 +114,7 @@ def save_event(event: dict) -> bool:
                 AND description IS NOT NULL
                 AND similarity(description, %s) > 0.95
                 AND id != %s
+                AND (COALESCE(is_ignored, false) = false OR ignored_reason = 'queue')
                 LIMIT 1
             ''', (event.get('date'), event.get('description'), new_id))
             duplicate = c.fetchone()
