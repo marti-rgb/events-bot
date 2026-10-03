@@ -1,3 +1,6 @@
+# sheets_config.py — v2 (имя файла не меняется: его импортирует parser.py)
+# v2 — выгрузка листов Google с headers=1: заголовок всегда одна строка (фикс 0 каналов 03–04.10.2026). Обновлено 04.10.2026
+# v1 — исходная версия
 import os
 import httpx
 import logging
@@ -7,7 +10,9 @@ import io
 SPREADSHEET_ID = os.getenv('SHEET_ID', '')
 
 def get_sheet_csv(sheet_name: str) -> list[list[str]]:
-    url = f'https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq?tqx=out:csv&sheet={sheet_name}'
+    # headers=1: exactly one header row. Without it Google guesses and may glue the first data row into the header
+    # (happened 03.10.2026 after new columns in «Каналы»: header became 'channel leelanr' -> 0 channels parsed)
+    url = f'https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq?tqx=out:csv&headers=1&sheet={sheet_name}'
     response = httpx.get(url, timeout=15)
     response.raise_for_status()
     reader = csv.reader(io.StringIO(response.text))
@@ -109,6 +114,3 @@ def load_stop_tags() -> list[str]:
     except Exception as e:
         logging.error(f"Ошибка загрузки стоп-тегов: {e}")
         return []
-
-
-
