@@ -1,4 +1,8 @@
-# analyzer.py — ВЕРСИЯ v44 — 11.10.2026
+# analyzer.py — ВЕРСИЯ v45 — 14.10.2026
+# v45 — sections (L1) are always brought to the справочник: the AI's answer is fitted by spelling (case, word order,
+# part of the name: «искусство и культура» → «Культура и искусство», «Бизнес» → «Бизнес и нетворкинг»); if nothing fits
+# and the post is an event — a short second request asks the AI to pick 1–2 sections from the list; if no model answers,
+# the post is returned as not processed (retried next run) instead of being thrown away. Every fit is logged. Updated 14.10.2026
 # v44 — правило цены в промпте: «бесплатно» только если бесплатен вход/участие для всех;
 # бесплатно с условием («для новых клиентов», «первым N», «по промокоду», «при покупке»,
 # «первое/пробное занятие бесплатно», «для подписчиков/участников клуба») → is_free = null
@@ -6,26 +10,12 @@
 # не делает мероприятие бесплатным; одна только регистрация/запись без цены → null, а не false
 # (у бесплатных мероприятий тоже бывает регистрация). Случай 26984: «Бесплатно для новых
 # клиентов центра…» — на сайте 7500 ₽. Обновлено 11.10.2026
-# v43 — правило for_children в промпте: детское = только для детей или «взрослым нельзя»;
-# семейное (null) = только если явно «для всей семьи / можно с детьми» или семейный
-# формат (парк, фестиваль, квест для всей семьи); взрослое = 18+ / «детям нельзя» или
-# лекция, концерт, вечеринка, стендап, бизнес, нетворкинг, психология, знакомства,
-# дегустация без упоминания детей; при сомнении и без упоминания детей — взрослое.
-# Раньше при сомнении модель ставила null («семейное»). Обновлено 06.10.2026
 #
-# История версий:
-# v42 — 27.08.2026: год события больше не угадывается моделью —
-# в промпт добавлена явная строка "Год этого поста", посчитанная из даты
-# публикации. Если дата публикации неизвестна — год не подставляется,
-# событие остаётся без даты (date = null), а не с случайным годом.
-# v41: Cerebras отключён, первый провайдер Z.ai (glm-4.5-flash),
-# запасные — Groq openai/gpt-oss-120b и openai/gpt-oss-20b; переключатель размышлений;
-# 429 без длинной паузы; правки промпта (цена, дата, диапазон дат);
-# честный лог первой линии; листание истории каналов; деление каналов на части;
-# первая линия отключаема (USE_SCREEN).
+# История версий (старше двух последних) — в versions_history.md
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
 import os
+import re
 import json
 import time
 import logging
@@ -98,6 +88,110 @@ def _chat(provider, client, model, prompt, max_tokens, temperature, thinking):
     if provider == 'zai':
         kwargs['extra_body'] = {"thinking": {"type": "enabled" if thinking else "disabled"}}
     return client.chat.completions.create(**kwargs)
+
+
+def _strip_fence(raw: str) -> str:
+    raw = (raw or '').strip()
+    if raw.startswith('```'):
+        raw = raw.split('```')[1]
+        if raw.startswith('json'):
+            raw = raw[4:]
+    return raw.strip()
+
+
+# ===== patch 2 (v45): fit the AI's sections (L1) to the справочник by spelling =====
+# Same section written differently: case, ё/е, word order, part of the name. Words shorter than 3 letters («и») are ignored;
+# words are compared by their first 5 letters («Выставка» = «Выставки», «Музыкальные» = «Музыка»).
+# Exactly one candidate — taken; none or several — not guessed (patch 3 decides).
+def _l1_words(s) -> set:
+    s = str(s or '').lower().replace('ё', 'е')
+    return {w[:5] for w in re.split(r'[^a-zа-я0-9]+', s) if len(w) >= 3}
+
+
+def _match_l1(value, valid_l1: list):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    v = value.strip().lower().replace('ё', 'е')
+    for c in valid_l1:
+        if c.lower().replace('ё', 'е') == v:
+            return c
+    vw = _l1_words(value)
+    if not vw:
+        return None
+    same = [c for c in valid_l1 if _l1_words(c) == vw]
+    if len(same) == 1:
+        return same[0]
+    part = [c for c in valid_l1 if vw <= _l1_words(c)]
+    if len(part) == 1:
+        return part[0]
+    return None
+
+
+def _fit_l1(raw, valid_l1: list) -> tuple[list, list]:
+    """Returns (sections from the справочник, values that did not fit)."""
+    if not isinstance(raw, list):
+        raw = [raw] if raw else []
+    fitted, left = [], []
+    for x in raw:
+        m = _match_l1(x, valid_l1)
+        if m is None:
+            left.append(x)
+            continue
+        if m != x:
+            logging.info(f"Категория подогнана: «{x}» → «{m}»")
+        if m not in fitted:
+            fitted.append(m)
+    return fitted, left
+
+
+# ===== patch 3 (v45): the AI picks the section by meaning when nothing fitted =====
+PICK_L1_PROMPT = """К какому разделу относится это мероприятие? Выбери 1–2 раздела СТРОГО из списка, слово в слово.
+Список разделов: {l1_list}
+Если ни один раздел не подходит — верни пустой массив.
+
+Мероприятие:
+{text}
+
+Ответь ТОЛЬКО валидным JSON без пояснений: {{"category_l1_arr": ["раздел"]}}"""
+
+
+def _pick_l1(post_text: str, data: dict, valid_l1: list):
+    """Returns a list of sections (may be empty) or None if no model answered."""
+    title = str(data.get('title') or '').strip()
+    desc = str(data.get('description') or '').strip()
+    text = f"{title}\n{desc}".strip() if desc else f"{title}\n{(post_text or '')[:1500]}".strip()
+    prompt = PICK_L1_PROMPT.format(l1_list=' / '.join(valid_l1), text=text[:2000])
+    last_rate_err = None
+    for attempt in (1, 2):
+        rate_limited = False
+        for provider, client, model in ANALYZE_CHAIN:
+            if client is None:
+                continue
+            try:
+                response = _chat(provider, client, model, prompt, max_tokens=400, temperature=0.0, thinking=False)
+                raw = _strip_fence(response.choices[0].message.content)
+                if not raw:
+                    continue
+                ans = json.loads(raw)
+                if isinstance(ans, dict):
+                    ans = ans.get('category_l1_arr', [])
+                fitted, _ = _fit_l1(ans, valid_l1)
+                return fitted[:2]
+            except json.JSONDecodeError as e:
+                logging.warning(f"pick_l1 JSON error {provider}/{model}: {e}")
+                continue
+            except Exception as e:
+                if _is_rate_limit(e):
+                    rate_limited = True
+                    last_rate_err = e
+                    continue
+                logging.warning(f"pick_l1 error {provider}/{model}: {e}")
+                continue
+        if attempt == 1 and rate_limited:
+            time.sleep(_retry_after(last_rate_err))
+            continue
+        break
+    return None
 
 PROMPT_TEMPLATE = """Проанализируй пост из Telegram-канала. Верни ТОЛЬКО валидный JSON без markdown, без пояснений.
 Дата публикации поста: {post_date}
@@ -263,8 +357,17 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
                     valid_l2 = [l2.lower() for l1_vals in categories.values() for l2 in l1_vals]
                     data['category_l2_arr'] = [x for x in data.get('category_l2_arr', []) if x in valid_l2]
                 if data and categories:
+                    # patch 2, 3 (v45): fit to the справочник; nothing fitted for an event -> the AI picks by meaning
                     valid_l1 = list(categories.keys())
-                    data['category_l1_arr'] = [x for x in data.get('category_l1_arr', []) if x in valid_l1]
+                    fitted, left = _fit_l1(data.get('category_l1_arr'), valid_l1)
+                    data['category_l1_arr'] = fitted
+                    if not fitted and data.get('is_event'):
+                        picked = _pick_l1(text, data, valid_l1)
+                        if picked is None:
+                            logging.warning(f"{model_used}: категория {left} не из справочника, повторный запрос не ответил — пост повторится в следующем прогоне")
+                            return None
+                        data['category_l1_arr'] = picked
+                        logging.info(f"Категория выбрана повторным запросом: {left} → {picked}")
                 if data and not data.get('category_l1_arr'):
                     data['is_event'] = False
                 if data:

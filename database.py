@@ -1,6 +1,6 @@
-# database.py — v2 (имя файла не меняется: его импортирует parser.py)
+# database.py — v3 (имя файла не меняется: его импортирует parser.py)
+# v3 — categories_catalog: load_categories_db() reads the copy of the sheet «Категории», save_categories_db() overwrites it after every successful read of the sheet (patch 1, 14.10.2026). Updated 14.10.2026
 # v2 — event_exists и проверка похожего описания сравнивают только с видимыми мероприятиями (опубликованы или в очереди queue); черновики, модерация, удалённые, отклонённые и дубликаты больше не прячут мероприятие из канала. Обновлено 03.10.2026
-# v1 — исходная версия
 import os
 import json
 import logging
@@ -148,6 +148,69 @@ def log_parse(channel: str, post_id: str, model: str, fallback: bool, success: b
         logging.error(f"log_parse error: {e}")
     finally:
         conn.close()
+
+# ===== patch 1 (v3): copy of the sheet «Категории» in the database =====
+# The parser reads the sheet first; on success it overwrites categories_catalog, so the copy is always fresh.
+# If the sheet did not answer, the parser reads this copy. The bots' catalog (get_categories_l1) is limited to it.
+CATALOG_MIN_SECTIONS = 5  # a sheet read with fewer sections is treated as broken and does not overwrite the copy
+
+def load_categories_db() -> dict:
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"load_categories_db connect error: {e}")
+        return {}
+    c = conn.cursor()
+    try:
+        c.execute('SELECT category_l1, category_l2 FROM categories_catalog ORDER BY id')
+        cats = {}
+        for row in c.fetchall():
+            l1 = (row['category_l1'] or '').strip()
+            l2 = (row['category_l2'] or '').strip()
+            if not l1:
+                continue
+            cats.setdefault(l1, [])
+            if l2 and l2 not in cats[l1]:
+                cats[l1].append(l2)
+        logging.info(f"Справочник из базы: разделов {len(cats)}")
+        return cats
+    except Exception as e:
+        logging.error(f"load_categories_db error: {e}")
+        return {}
+    finally:
+        conn.close()
+
+def save_categories_db(categories: dict):
+    """Returns True (saved), False (database error) or None (not saved: the sheet looks broken)."""
+    if not categories or len(categories) < CATALOG_MIN_SECTIONS:
+        logging.warning(f"save_categories_db: в листе всего {len(categories or {})} разделов — копию в базе не перезаписываю")
+        return None
+    rows = []
+    for l1, l2_list in categories.items():
+        for l2 in (l2_list or ['']):
+            rows.append((len(rows) + 1, l1, l2 or ''))
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"save_categories_db connect error: {e}")
+        return False
+    c = conn.cursor()
+    try:
+        c.execute('LOCK TABLE categories_catalog IN EXCLUSIVE MODE')  # parallel parser parts wait for each other
+        c.execute('DELETE FROM categories_catalog')
+        c.executemany(
+            'INSERT INTO categories_catalog (id, category_l1, category_l2) VALUES (%s, %s, %s)',
+            rows)
+        conn.commit()
+        logging.info(f"Копия справочника в базе обновлена: разделов {len(categories)}, строк {len(rows)}")
+        return True
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"save_categories_db error: {e}")
+        return False
+    finally:
+        conn.close()
+
 def log_rejected_post(channel: str, post_id: str, text: str):
     """Сохраняет текст поста, который нейросеть сочла НЕ событием —
     для последующего поиска новых стоп-слов частотным анализом.

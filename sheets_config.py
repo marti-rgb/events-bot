@@ -1,6 +1,6 @@
-# sheets_config.py — v2 (имя файла не меняется: его импортирует parser.py)
+# sheets_config.py — v3 (имя файла не меняется: его импортирует parser.py)
+# v3 — CATEGORIES_FALLBACK: the 16 sections built into the code, last resort when neither the Google sheet nor the database copy answered (patch 1, 14.10.2026). Updated 14.10.2026
 # v2 — выгрузка листов Google с headers=1: заголовок всегда одна строка (фикс 0 каналов 03–04.10.2026). Обновлено 04.10.2026
-# v1 — исходная версия
 import os
 import httpx
 import logging
@@ -66,6 +66,17 @@ def load_keywords() -> list[str]:
         return []
 
 UNAVAILABLE_CHANNELS = []
+
+# patch 1 (v3): last-resort list of sections (L1) when neither the Google sheet nor categories_catalog answered.
+# No subcategories here — in this mode L2 is not kept. If the sheet «Категории» changes, update this list too.
+CATEGORIES_FALLBACK = {
+    'Культура и искусство': [], 'Музыка': [], 'Кино': [], 'Театр и шоу': [],
+    'Выставки': [], 'Спорт и активности': [], 'Образование и лекции': [],
+    'Игры': [], 'Вечеринки и тусовки': [], 'Фестивали': [], 'Для детей': [],
+    'Знакомства': [], 'Психология и практики': [], 'Бизнес и нетворкинг': [],
+    'Творчество': [], 'Онлайн': [],
+}
+
 def load_categories() -> dict:
     try:
         rows = get_sheet_csv('Категории')

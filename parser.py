@@ -1,29 +1,11 @@
-# ВЕРСИЯ v48 — 28.08.2026
-# Изменено относительно v47: текст поста, который нейросеть сочла НЕ событием,
-# теперь дополнительно сохраняется в таблицу rejected_posts (не только в
-# консольный лог) — чтобы искать новые стоп-слова частотным анализом по базе,
-# а не вручную по логам отдельных прогонов.
-# Изменено относительно v46: добавлено логирование ОРИГИНАЛЬНОГО текста поста
-# (не пересказа модели), когда модель сочла его НЕ событием — чтобы искать
-# реальные паттерны для расширения списка ключевых слов/стоп-тегов.
-# Изменено относительно v45: добавлено логирование, когда пост отсеивается
-# стоп-тегом — видно, каким именно тегом и какой текст отсеян, чтобы можно
-# было проверять по факту, не режет ли какой-то стоп-тег настоящие события.
-# Изменено относительно v44: пост помечается обработанным (mark_post_processed)
-# ТОЛЬКО если модель реально вернула результат. Раньше помечался всегда, даже
-# при полном отказе и Z.ai, и Groq одновременно — такой пост терялся навсегда,
-# следующий прогон его больше не трогал. Теперь при полном отказе пост остаётся
-# в очереди и будет предпринята повторная попытка на следующем прогоне.
-# Изменено относительно v41: фильтр постов по дате публикации (PARSE_SINCE):
-# посты старше указанной даты пропускаются без вызова модели.
-# Изменено относительно v42: мягкая остановка по времени (MAX_RUN_MINUTES) —
-# при подходе к лимиту GitHub Actions прогон завершается сам, зелёной галочкой,
-# а не обрывается по Cancelled.
-# Изменено относительно v40: Cerebras отключён, первый провайдер Z.ai (glm-4.5-flash),
-# запасные — Groq openai/gpt-oss-120b и openai/gpt-oss-20b; переключатель размышлений;
-# 429 без длинной паузы; правки промпта (цена, дата, диапазон дат);
-# честный лог первой линии; листание истории каналов; деление каналов на части;
-# первая линия отключаема (USE_SCREEN).
+# parser.py — ВЕРСИЯ v49 — 14.10.2026
+# v49 — справочник категорий: Google-лист → копия в базе (categories_catalog, обновляется после каждого удачного
+# чтения листа) → вшитый список в коде; фильтр категорий больше не отключается. Справочник не из листа или копия
+# в базе не обновилась — сообщение админу (notify.py). Updated 14.10.2026
+# v48 — 28.08.2026: текст поста, который нейросеть сочла НЕ событием, дополнительно сохраняется в таблицу
+# rejected_posts — чтобы искать новые стоп-слова частотным анализом по базе.
+#
+# История версий (старше двух последних) — в versions_history.md
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
 #   PARSE_SINCE=(пусто) — нижняя граница по дате публикации поста, ГГГГ-ММ-ДД
@@ -35,7 +17,9 @@ from bs4 import BeautifulSoup
 from analyzer import analyze_post, screen_post
 from database import log_parse, start_parse_session, finish_parse_session
 from database import is_post_processed, mark_post_processed, save_event, log_rejected_post
-from sheets_config import load_channels, load_keywords, load_categories, match_category_l2, load_stop_tags, UNAVAILABLE_CHANNELS
+from database import load_categories_db, save_categories_db
+from sheets_config import load_channels, load_keywords, load_categories, match_category_l2, load_stop_tags, UNAVAILABLE_CHANNELS, CATEGORIES_FALLBACK
+from notify import notify
 import os
 
 HEADERS = {
@@ -262,6 +246,37 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
     
     return fetched, processed, saved, skipped, error
 
+
+# ===== patch 1 (v49): справочник категорий never empty =====
+# Google sheet (the user edits it) → its copy in the database → the list built into the code.
+# The sheet answered -> the copy in the database is overwritten (the bots' catalog uses it).
+# Anything but a clean sheet read -> one message to the admin per run.
+async def load_categories_safe() -> dict:
+    cats = load_categories()
+    problem = None
+    if cats:
+        saved = save_categories_db(cats)
+        if saved is False:
+            problem = 'лист Google прочитан, но копию справочника в базе обновить не удалось (база не ответила). Каталог в ботах работает по старой копии.'
+        elif saved is None:
+            problem = f'в листе Google всего {len(cats)} разделов — похоже на сбой чтения, копию в базе не трогал. Прогон идёт по этому листу.'
+        source = 'лист Google'
+    else:
+        cats = load_categories_db()
+        source = 'копия в базе (лист Google не ответил)'
+        if not cats:
+            cats = {k: list(v) for k, v in CATEGORIES_FALLBACK.items()}
+            source = 'вшитый список в коде (не ответили ни лист Google, ни база)'
+        problem = (f'справочник категорий взят не из листа Google.\nИсточник: {source}, разделов: {len(cats)}.\n'
+                   'Если вы недавно меняли лист — новые категории в этот раз не учтутся.')
+        if source.startswith('вшитый'):
+            problem += '\nПодкатегории в этом прогоне не сохраняются.'
+    logging.warning(f"Справочник категорий: {source}, разделов {len(cats)}")
+    if problem:
+        await notify(f"⚠️ Парсер: {problem}\nПрогон идёт, мероприятия не теряются.")
+    return cats
+
+
 async def run_parser():
     logging.info("Начинаем парсинг через t.me/s/...")
     
@@ -283,7 +298,7 @@ async def run_parser():
             logging.warning(f"CHANNELS_PART='{part}' — не понял формат, беру все каналы")
 
     FILTER_KEYWORDS = load_keywords()
-    CATEGORIES = load_categories()
+    CATEGORIES = await load_categories_safe()  # patch 1 (v49)
     STOP_TAGS = load_stop_tags()
     
     logging.info(f"Каналов: {len(CHANNELS)}, ключевых слов: {len(FILTER_KEYWORDS)}")

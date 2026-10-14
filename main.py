@@ -1,30 +1,18 @@
+# main.py — v2
+# v2 — notify() moved to notify.py (parser.py uses it too); behaviour unchanged. Updated 14.10.2026
 import asyncio
 import os
-import httpx
 os.environ['TZ'] = 'Europe/Moscow'
 import logging
 from scheduler import start_scheduler
 from database import has_session_today
+from notify import notify
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
-TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-ADMIN_ID = '8231938381'
-
-async def notify(text: str):
-    if not TELEGRAM_TOKEN:
-        return
-    try:
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
-                json={'chat_id': ADMIN_ID, 'text': text}
-            )
-    except Exception as e:
-        logging.error(f"notify error: {e}")
 
 async def main():
     logging.info("Starting Events Bot...")
