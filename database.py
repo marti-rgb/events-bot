@@ -1,4 +1,7 @@
-# database.py — v3 (имя файла не меняется: его импортирует parser.py)
+# database.py — v4 (имя файла не меняется: его импортирует parser.py)
+# v4 — ON CONFLICT matches the new partial unique index events_source_url_uq (migration_20261015_dup_mod.sql):
+#      an event deleted by its author (ignored_reason = 'manual') no longer holds its post link, so the parser may
+#      pick the same post up again. MUST be deployed together with that migration. Updated 15.10.2026
 # v3 — categories_catalog: load_categories_db() reads the copy of the sheet «Категории», save_categories_db() overwrites it after every successful read of the sheet (patch 1, 14.10.2026). Updated 14.10.2026
 # v2 — event_exists и проверка похожего описания сравнивают только с видимыми мероприятиями (опубликованы или в очереди queue); черновики, модерация, удалённые, отклонённые и дубликаты больше не прячут мероприятие из канала. Обновлено 03.10.2026
 import os
@@ -102,7 +105,7 @@ def save_event(event: dict) -> bool:
         c.execute('''
             INSERT INTO events (title, date, time, is_free, for_children, format, category_l1_arr, category_l2_arr, description, location, address, price, source_url, channel, city, model, city_parsed)
             VALUES (%(title)s, %(date)s, %(time)s, %(is_free)s, %(for_children)s, %(format)s, %(category_l1_arr)s, %(category_l2_arr)s, %(description)s, %(location)s, %(address)s, %(price)s, %(source_url)s, %(channel)s, %(city)s, %(model)s, %(city_parsed)s)
-            ON CONFLICT (source_url) DO NOTHING
+            ON CONFLICT (source_url) WHERE ignored_reason IS DISTINCT FROM 'manual' DO NOTHING
             RETURNING id
         ''', event)
         row = c.fetchone()
