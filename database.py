@@ -1,9 +1,13 @@
-# database.py — v4 (имя файла не меняется: его импортирует parser.py)
+# database.py — v5 (имя файла не меняется: его импортирует parser.py)
+# v5 — task 56 (semantic duplicates): save_event() returns the new event id instead of True/False, plus the
+#      database side of dedup.py — vectors (event_vectors), candidate search inside the same day + city,
+#      groups for manual review (dup_groups / dup_group_items) and the «кого оставить» rule.
+#      Needs migration_20261021_dup.sql. Updated 21.10.2026
 # v4 — ON CONFLICT matches the new partial unique index events_source_url_uq (migration_20261015_dup_mod.sql):
 #      an event deleted by its author (ignored_reason = 'manual') no longer holds its post link, so the parser may
 #      pick the same post up again. MUST be deployed together with that migration. Updated 15.10.2026
-# v3 — categories_catalog: load_categories_db() reads the copy of the sheet «Категории», save_categories_db() overwrites it after every successful read of the sheet (patch 1, 14.10.2026). Updated 14.10.2026
-# v2 — event_exists и проверка похожего описания сравнивают только с видимыми мероприятиями (опубликованы или в очереди queue); черновики, модерация, удалённые, отклонённые и дубликаты больше не прячут мероприятие из канала. Обновлено 03.10.2026
+#
+# История версий (старше двух последних) — в versions_history.md
 import os
 import json
 import logging
@@ -91,9 +95,10 @@ def event_exists(title: str, date: str) -> bool:
     conn.close()
     return result is not None
 
-def save_event(event: dict) -> bool:
+def save_event(event: dict):
+    """v5: returns the id of the saved event, or None. The parser keeps using it as a yes/no check."""
     if event_exists(event.get('title', ''), event.get('date', '')):
-        return False
+        return None
     conn = get_conn()
     c = conn.cursor()
     try:
@@ -109,8 +114,8 @@ def save_event(event: dict) -> bool:
             RETURNING id
         ''', event)
         row = c.fetchone()
+        new_id = row['id'] if row else None
         if row and event.get('description'):
-            new_id = row['id']
             c.execute('''
                 SELECT id FROM events 
                 WHERE date = %s 
@@ -127,13 +132,14 @@ def save_event(event: dict) -> bool:
                     WHERE id = %s
                 ''', (new_id,))
                 logging.info(f"Дубликат помечен: id={new_id}, оригинал id={duplicate['id']}")
+                new_id = None  # already hidden by the old 0.95 check — nothing for dedup.py to do
         conn.commit()
         conn.close()
-        return True
+        return new_id
     except Exception as e:
         logging.error(f"save_event error: {e}")
         conn.close()
-        return False
+        return None
 
 def log_parse(channel: str, post_id: str, model: str, fallback: bool, success: bool, error: str = None, category_l1_arr: list = [], category_l2_arr: list = [], stage: str = 'analyze'):
     conn = get_conn()
@@ -293,5 +299,344 @@ def has_session_today() -> bool:
     except Exception as e:
         logging.error(f"has_session_today error: {e}")
         return False
+    finally:
+        conn.close()
+
+
+# ===== v5: semantic duplicates (task 56). The brain lives in dedup.py, the SQL lives here. =====
+# Tables and settings come from migration_20261021_dup.sql:
+#   event_vectors (event_id, vec, model, built_at)
+#   dup_groups (id, day, city, keep_id, status, decided_at, created_at)
+#   dup_group_items (group_id, event_id, score, by_ai, reason, hidden)
+#   bot_settings: dup_hi, dup_lo, dup_auto, dup_ai_budget
+
+DUP_DEFAULTS = {'dup_hi': 0.93, 'dup_lo': 0.80, 'dup_auto': 'off', 'dup_ai_budget': 50}
+
+
+def get_dup_settings() -> dict:
+    """Thresholds and switches, read once per run. Any missing or broken value falls back to the default."""
+    out = {'hi': DUP_DEFAULTS['dup_hi'], 'lo': DUP_DEFAULTS['dup_lo'],
+           'auto': False, 'ai_budget': DUP_DEFAULTS['dup_ai_budget']}
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"get_dup_settings connect error: {e}")
+        return out
+    c = conn.cursor()
+    try:
+        c.execute("SELECT key, value FROM bot_settings WHERE key LIKE 'dup\\_%'")
+        raw = {row['key']: (row['value'] or '').strip() for row in c.fetchall()}
+        try:
+            out['hi'] = float(raw.get('dup_hi', DUP_DEFAULTS['dup_hi']))
+        except ValueError:
+            pass
+        try:
+            out['lo'] = float(raw.get('dup_lo', DUP_DEFAULTS['dup_lo']))
+        except ValueError:
+            pass
+        try:
+            out['ai_budget'] = max(0, int(raw.get('dup_ai_budget', DUP_DEFAULTS['dup_ai_budget'])))
+        except ValueError:
+            pass
+        out['auto'] = raw.get('dup_auto', 'off').lower() in ('1', 'on', 'true', 'yes')
+        if out['lo'] > out['hi']:
+            out['lo'] = out['hi']
+        return out
+    except Exception as e:
+        logging.error(f"get_dup_settings error: {e}")
+        return out
+    finally:
+        conn.close()
+
+
+def _vec_literal(vec) -> str:
+    return '[' + ','.join(f"{float(x):.6f}" for x in vec) + ']'
+
+
+def save_event_vector(event_id: int, vec, model: str) -> bool:
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"save_event_vector connect error: {e}")
+        return False
+    c = conn.cursor()
+    try:
+        c.execute('''
+            INSERT INTO event_vectors (event_id, vec, model)
+            VALUES (%s, %s::vector, %s)
+            ON CONFLICT (event_id) DO UPDATE SET vec = excluded.vec, model = excluded.model, built_at = now()
+        ''', (event_id, _vec_literal(vec), model))
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"save_event_vector error (event {event_id}): {e}")
+        return False
+    finally:
+        conn.close()
+
+
+def event_city(event_id: int):
+    """City the way search understands it: what the AI found in the post, otherwise the channel's city."""
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"event_city connect error: {e}")
+        return None
+    c = conn.cursor()
+    try:
+        c.execute("""
+            SELECT COALESCE(NULLIF(city_parsed->>0, ''), NULLIF(city, '')) AS city
+            FROM events WHERE id = %s
+        """, (event_id,))
+        row = c.fetchone()
+        return row['city'] if row else None
+    except Exception as e:
+        logging.error(f"event_city error: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def find_events_without_vector(day: str, city, limit: int) -> list:
+    """Events of the same day and city that have no vector yet — the backfill of what was already in the base."""
+    if limit <= 0:
+        return []
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"find_events_without_vector connect error: {e}")
+        return []
+    c = conn.cursor()
+    try:
+        c.execute("""
+            SELECT e.id, e.title, e.location, e.address, e.description
+            FROM events e
+            LEFT JOIN event_vectors v ON v.event_id = e.id
+            WHERE v.event_id IS NULL
+              AND e.date = %s
+              AND COALESCE(NULLIF(e.city_parsed->>0, ''), NULLIF(e.city, '')) IS NOT DISTINCT FROM %s
+              AND (COALESCE(e.is_ignored, false) = false OR e.ignored_reason = 'queue')
+            ORDER BY e.id DESC
+            LIMIT %s
+        """, (day, city, limit))
+        return [dict(row) for row in c.fetchall()]
+    except Exception as e:
+        logging.error(f"find_events_without_vector error: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def find_dup_candidates(event_id: int, limit: int, min_score: float) -> list:
+    """Nearest events by meaning inside the same day and city.
+    Skipped: other time (unless one of the two has none), rows of the same post, pairs the admin already
+    called «не дубли», and everything hidden from search."""
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"find_dup_candidates connect error: {e}")
+        return []
+    c = conn.cursor()
+    try:
+        c.execute("""
+            WITH me AS (
+                SELECT e.id,
+                       e.date,
+                       COALESCE(NULLIF(e.city_parsed->>0, ''), NULLIF(e.city, '')) AS city,
+                       NULLIF(e.time, '') AS tm,
+                       split_part(COALESCE(e.source_url, ''), '#', 1) AS post_url,
+                       v.vec AS vec
+                FROM events e
+                JOIN event_vectors v ON v.event_id = e.id
+                WHERE e.id = %s
+            )
+            SELECT e.id, e.title, e.date, e.time, e.location, e.address, e.price, e.description,
+                   (1 - (v.vec <=> me.vec)) AS score
+            FROM events e
+            JOIN event_vectors v ON v.event_id = e.id
+            CROSS JOIN me
+            WHERE e.id <> me.id
+              AND e.date = me.date
+              AND COALESCE(NULLIF(e.city_parsed->>0, ''), NULLIF(e.city, '')) IS NOT DISTINCT FROM me.city
+              AND (COALESCE(e.is_ignored, false) = false OR e.ignored_reason = 'queue')
+              AND (NULLIF(e.time, '') IS NULL OR me.tm IS NULL OR NULLIF(e.time, '') = me.tm)
+              AND split_part(COALESCE(e.source_url, ''), '#', 1) <> me.post_url
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM dup_group_items a
+                    JOIN dup_group_items b ON b.group_id = a.group_id
+                    JOIN dup_groups g ON g.id = a.group_id
+                    WHERE a.event_id = me.id AND b.event_id = e.id
+                      AND (g.status = 'rejected'
+                           OR COALESCE(a.reason, '') = 'excluded'
+                           OR COALESCE(b.reason, '') = 'excluded')
+              )
+              AND (1 - (v.vec <=> me.vec)) >= %s
+            ORDER BY v.vec <=> me.vec
+            LIMIT %s
+        """, (event_id, min_score, limit))
+        return [dict(row) for row in c.fetchall()]
+    except Exception as e:
+        logging.error(f"find_dup_candidates error (event {event_id}): {e}")
+        return []
+    finally:
+        conn.close()
+
+
+# Which one stays, in the order agreed with the user: organizer → price → address → photo → registration
+# link → longer description → added later. The first line is also the human-readable reason.
+_KEEP_ORDER = """
+    (added_by_user IS NOT NULL) DESC,
+    (COALESCE(NULLIF(price, ''), '') <> '') DESC,
+    (COALESCE(NULLIF(address, ''), '') <> '') DESC,
+    (COALESCE(NULLIF(photo_id, ''), '') <> '' OR media_message_id IS NOT NULL) DESC,
+    (COALESCE(NULLIF(reg_link, ''), '') <> '') DESC,
+    length(COALESCE(description, '')) DESC,
+    created_at DESC,
+    id DESC
+"""
+
+
+def _recompute_keep(c, group_id: int):
+    """Picks the survivor of the group and writes a short reason into dup_groups.keep_id / items."""
+    c.execute(f"""
+        SELECT id,
+               (added_by_user IS NOT NULL) AS is_org,
+               (COALESCE(NULLIF(price, ''), '') <> '') AS has_price,
+               (COALESCE(NULLIF(address, ''), '') <> '') AS has_addr,
+               (COALESCE(NULLIF(photo_id, ''), '') <> '' OR media_message_id IS NOT NULL) AS has_photo,
+               (COALESCE(NULLIF(reg_link, ''), '') <> '') AS has_link
+        FROM events
+        WHERE id IN (SELECT event_id FROM dup_group_items
+                     WHERE group_id = %s AND COALESCE(reason, '') <> 'excluded')
+        ORDER BY {_KEEP_ORDER}
+        LIMIT 1
+    """, (group_id,))
+    row = c.fetchone()
+    if not row:
+        return None
+    if row['is_org']:
+        why = 'от организатора'
+    elif row['has_price']:
+        why = 'указана цена'
+    elif row['has_addr']:
+        why = 'указан адрес'
+    elif row['has_photo']:
+        why = 'есть фото'
+    elif row['has_link']:
+        why = 'есть ссылка на регистрацию'
+    else:
+        why = 'добавлено позже'
+    c.execute('UPDATE dup_groups SET keep_id = %s WHERE id = %s', (row['id'], group_id))
+    c.execute("""
+        UPDATE dup_group_items SET reason = %s
+        WHERE group_id = %s AND event_id = %s AND COALESCE(reason, '') <> 'excluded'
+    """, (f'оставляем: {why}', group_id, row['id']))
+    return row['id']
+
+
+def create_or_join_group(day: str, city, new_id: int, other_id: int, score: float, by_ai: bool, reason: str):
+    """Returns (joined, group_id). If one of the two already waits in a group, the pair joins it
+    instead of creating a second group about the same event."""
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"create_or_join_group connect error: {e}")
+        return False, None
+    c = conn.cursor()
+    try:
+        c.execute("""
+            SELECT g.id FROM dup_groups g
+            JOIN dup_group_items i ON i.group_id = g.id
+            WHERE g.status = 'wait' AND i.event_id IN (%s, %s)
+            ORDER BY g.id LIMIT 1
+        """, (new_id, other_id))
+        row = c.fetchone()
+        joined = bool(row)
+        if joined:
+            group_id = row['id']
+        else:
+            c.execute('INSERT INTO dup_groups (day, city) VALUES (%s, %s) RETURNING id', (day, city))
+            group_id = c.fetchone()['id']
+        c.execute("""
+            INSERT INTO dup_group_items (group_id, event_id, score, by_ai, reason)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (group_id, event_id) DO NOTHING
+        """, (group_id, other_id, None, False, ''))
+        c.execute("""
+            INSERT INTO dup_group_items (group_id, event_id, score, by_ai, reason)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (group_id, event_id) DO UPDATE
+                SET score = excluded.score, by_ai = excluded.by_ai, reason = excluded.reason
+        """, (group_id, new_id, round(float(score), 3), by_ai, (reason or '')[:200]))
+        _recompute_keep(c, group_id)
+        conn.commit()
+        logging.info(f"Дубли: {'дописано в группу' if joined else 'новая группа'} {group_id} "
+                     f"({new_id} ↔ {other_id}, похожесть {score:.2f})")
+        return joined, group_id
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"create_or_join_group error ({new_id} ↔ {other_id}): {e}")
+        return False, None
+    finally:
+        conn.close()
+
+
+def hide_losers(group_id: int) -> int:
+    """Automatic mode only (bot_settings.dup_auto = on). Hides everyone in the group but the survivor.
+    Hidden, not deleted: ignored_reason = 'duplicate' and dup_of points at the survivor."""
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"hide_losers connect error: {e}")
+        return 0
+    c = conn.cursor()
+    try:
+        c.execute('SELECT keep_id FROM dup_groups WHERE id = %s', (group_id,))
+        row = c.fetchone()
+        keep_id = row['keep_id'] if row else None
+        if not keep_id:
+            return 0
+        c.execute("""
+            UPDATE events SET is_ignored = true, ignored_reason = 'duplicate', dup_of = %s
+            WHERE id IN (SELECT event_id FROM dup_group_items
+                         WHERE group_id = %s AND COALESCE(reason, '') <> 'excluded')
+              AND id <> %s
+              AND (COALESCE(is_ignored, false) = false OR ignored_reason = 'queue')
+            RETURNING id
+        """, (keep_id, group_id, keep_id))
+        hidden = [r['id'] for r in c.fetchall()]
+        if hidden:
+            c.execute("""
+                UPDATE dup_group_items SET hidden = true
+                WHERE group_id = %s AND event_id = ANY(%s)
+            """, (group_id, hidden))
+        c.execute("""
+            UPDATE dup_groups SET status = 'auto', decided_at = now() WHERE id = %s
+        """, (group_id,))
+        conn.commit()
+        return len(hidden)
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"hide_losers error (group {group_id}): {e}")
+        return 0
+    finally:
+        conn.close()
+
+
+def mark_dup_checked(event_id: int):
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"mark_dup_checked connect error: {e}")
+        return
+    c = conn.cursor()
+    try:
+        c.execute('UPDATE events SET dup_checked_at = now() WHERE id = %s', (event_id,))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"mark_dup_checked error: {e}")
     finally:
         conn.close()

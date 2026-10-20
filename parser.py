@@ -1,14 +1,17 @@
-# parser.py — ВЕРСИЯ v49 — 14.10.2026
+# parser.py — ВЕРСИЯ v50 — 21.10.2026
+# v50 — task 56: after every saved event the semantic duplicate check runs (dedup.py), wrapped so that any of its
+# failures only get logged and reported once per run — parsing itself never stops. The run ends with one summary
+# line about duplicates. Needs dedup.py v1, database.py v5 and migration_20261021_dup.sql. Updated 21.10.2026
 # v49 — справочник категорий: Google-лист → копия в базе (categories_catalog, обновляется после каждого удачного
 # чтения листа) → вшитый список в коде; фильтр категорий больше не отключается. Справочник не из листа или копия
 # в базе не обновилась — сообщение админу (notify.py). Updated 14.10.2026
-# v48 — 28.08.2026: текст поста, который нейросеть сочла НЕ событием, дополнительно сохраняется в таблицу
-# rejected_posts — чтобы искать новые стоп-слова частотным анализом по базе.
 #
 # История версий (старше двух последних) — в versions_history.md
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
 #   PARSE_SINCE=(пусто) — нижняя граница по дате публикации поста, ГГГГ-ММ-ДД
+#   DUP_ON=1 — поиск дублей (0 — выключить, парсер работает как раньше)
+#   DUP_MODEL=@cf/baai/bge-m3   DUP_FILL_MAX=400 — сколько старых мероприятий получает вектор за прогон
 import asyncio
 import logging
 import time
@@ -21,6 +24,14 @@ from database import load_categories_db, save_categories_db
 from sheets_config import load_channels, load_keywords, load_categories, match_category_l2, load_stop_tags, UNAVAILABLE_CHANNELS, CATEGORIES_FALLBACK
 from notify import notify
 import os
+
+# patch 2 (v50): duplicates live in their own file. A broken dedup.py must not stop the parser,
+# so even the import is guarded — without it the parser simply works the way it did before.
+try:
+    import dedup
+except Exception as _dedup_import_error:
+    dedup = None
+    logging.error(f"dedup.py не загрузился, поиск дублей выключен: {_dedup_import_error}")
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
@@ -235,12 +246,20 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 'category_l2_arr': result.get('category_l2_arr', []),
                 'model': result.get('model'),
             }
-            if save_event(event):
+            new_event_id = save_event(event)  # v5: the id of the saved event, None if it was not saved
+            if new_event_id:
                 if len(result.get('category_l1_arr', [])) >= 16:
                     mark_post_processed(channel, int(msg_id))
                     continue
                 saved += 1
                 logging.info(f"✅ {event['title']} | {event['date']} | @{channel}")
+                # patch 2 (v50): semantic duplicate check. Nothing is hidden while dup_auto is off —
+                # pairs are only put in the queue for the admin to confirm in the add-bot.
+                if dedup is not None:
+                    try:
+                        await dedup.process(new_event_id, event)
+                    except Exception as e:
+                        logging.error(f"Проверка дублей не прошла (мероприятие {new_event_id}): {e}")
         
         await asyncio.sleep(1.5)
     
@@ -348,4 +367,13 @@ async def run_parser():
             'channels': len(CHANNELS)
         })
     logging.info(f"Готово. Получено: {total_fetched}, обработано: {total_processed}, сохранено: {total_saved}")
+
+    # patch 2 (v50): one summary about duplicates — in the log always, to the admin only if there is
+    # something to say (new groups) or something went wrong.
+    if dedup is not None:
+        try:
+            await dedup.finish_run(notify)
+        except Exception as e:
+            logging.error(f"Итог по дублям не отправлен: {e}")
+
     return total_processed, total_saved
