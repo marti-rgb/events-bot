@@ -1,7 +1,9 @@
 name: Parse Events
-# ВЕРСИЯ v43 — 28.08.2026
-# Добавлено: concurrency-группа (одинаковая часть не запускается параллельно
-# сама с собой), SHEET_ID теперь читается из secrets, а не из кода.
+# ВЕРСИЯ v44 — 21.10.2026
+# v44 — task 56: keys for Cloudflare Workers AI (CF_ACCOUNT_ID, CF_AI_TOKEN) and the duplicate switches
+#       DUP_ON / DUP_MODEL / DUP_FILL_MAX. DUP_ON=0 turns the whole duplicate check off without touching code.
+# v43 — 28.08.2026: concurrency-группа (одинаковая часть не запускается параллельно
+#       сама с собой), SHEET_ID теперь читается из secrets, а не из кода.
 on:
   schedule:
     - cron: '0 1 * * *'
@@ -60,5 +62,10 @@ jobs:
           ANALYZE_THINKING: ${{ inputs.thinking == 'включить' && '1' || (inputs.thinking == 'выключить' && '0' || vars.ANALYZE_THINKING || '0') }}
           CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_AI_TOKEN: ${{ secrets.CF_AI_TOKEN }}
+          DUP_ON: ${{ vars.DUP_ON || '1' }}
+          DUP_MODEL: ${{ vars.DUP_MODEL || '@cf/baai/bge-m3' }}
+          DUP_FILL_MAX: ${{ vars.DUP_FILL_MAX || '400' }}
           IS_BACKUP_RUN: ${{ github.event.schedule == '0 2 * * *' && '1' || '0' }}
         run: python main.py
