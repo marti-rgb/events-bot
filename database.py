@@ -1,15 +1,14 @@
-# database.py — v7 (имя файла не меняется: его импортирует parser.py)
+# database.py — v8 (имя файла не меняется: его импортирует parser.py)
+# v8 — task 56: the «кого оставить» reason knows the description rule. A card that won because its description is
+#      the longest one in the group used to be labelled «добавлено позже» (the last branch), which contradicted the
+#      visible ids — the choice was right, the explanation wasn't. New reason «описание подробнее»; the rule order
+#      itself is unchanged. The same branch was added to the add-bot (v84). No migration. Updated 22.10.2026
 # v7 — task 56: create_or_join_group() merges two waiting groups when a pair links them (piles 1+2 and 3+4 of
 #      the same event used to stay apart and each kept its own survivor) and returns a dict with the members;
 #      an 'excluded' row is never brought back by a merge or a re-pair; the time rule now compares my side's
 #      times with the candidate side's (mine + my waiting groups vs its + its groups); a stale «оставляем» mark
 #      is cleared when the survivor changes; record_not_dup() keeps the judge's «разные» as a closed pair so it is
 #      never asked twice. New dup_groups.status 'merged' and 'ai_no'. Needs dedup.py v3. Updated 22.10.2026
-# v6 — task 56, old events: list/count of future events never checked for duplicates, bulk vector save,
-#      find_dup_candidates(only_checked=…) so every pair is looked at once, a pair already sharing a group is
-#      never offered again, a pair is not offered if it would put two different times into one waiting group,
-#      past waiting groups are closed (status 'expired'), setting dup_old_ai_budget, get_setting/set_setting.
-#      No schema change; the dup_old_ai_budget row is block 1 of migration_20261022_dup_old.sql. Updated 22.10.2026
 #
 # История версий (старше двух последних) — в versions_history.md
 import os
@@ -574,7 +573,11 @@ def _recompute_keep(c, group_id: int):
                (COALESCE(NULLIF(price, ''), '') <> '') AS has_price,
                (COALESCE(NULLIF(address, ''), '') <> '') AS has_addr,
                (COALESCE(NULLIF(photo_id, ''), '') <> '' OR media_message_id IS NOT NULL) AS has_photo,
-               (COALESCE(NULLIF(reg_link, ''), '') <> '') AS has_link
+               (COALESCE(NULLIF(reg_link, ''), '') <> '') AS has_link,
+               -- v8: did this card win by the length of its description? (the only one that long, and not empty)
+               (length(COALESCE(description, '')) > 0
+                AND length(COALESCE(description, '')) = max(length(COALESCE(description, ''))) OVER ()
+                AND count(*) OVER (PARTITION BY length(COALESCE(description, ''))) = 1) AS longest_desc
         FROM events
         WHERE id IN (SELECT event_id FROM dup_group_items
                      WHERE group_id = %s AND COALESCE(reason, '') <> 'excluded')
@@ -594,6 +597,8 @@ def _recompute_keep(c, group_id: int):
         why = 'есть фото'
     elif row['has_link']:
         why = 'есть ссылка на регистрацию'
+    elif row['longest_desc']:
+        why = 'описание подробнее'
     else:
         why = 'добавлено позже'
     c.execute('UPDATE dup_groups SET keep_id = %s WHERE id = %s', (row['id'], group_id))

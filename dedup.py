@@ -1,4 +1,8 @@
-# dedup.py — v3
+# dedup.py — v4
+# v4 — task 56: the judge's answer ceiling is 200 → 1500 tokens (variable DUP_JUDGE_TOKENS). gpt-oss-120b reasons
+#      before answering and the reasoning ate the 200, so Groq returned empty or truncated JSON («Expecting value»,
+#      «Unterminated string») and every pair went to the slower reserve — about 90 s instead of 25 s per pair, and
+#      the free Groq day was spent on answers nobody could read. Reasoning is left on (decision 21.10). 22.10.2026
 # v3 — task 56: every event is compared with all its nearest neighbours (up to 5), not only until the first match,
 #      and a pair that links two waiting groups merges them (database.py v7) — piles 1+2 and 3+4 of one event no
 #      longer survive as two groups that keep two copies visible after approval. A neighbour already in the
@@ -21,7 +25,8 @@
 #
 # GitHub secrets:   CF_ACCOUNT_ID, CF_AI_TOKEN
 # GitHub variables: DUP_ON (1/0, default 1), DUP_MODEL (default @cf/baai/bge-m3), DUP_FILL_MAX (default 400),
-#                   DUP_OLD_MAX (default 3000), DUP_JUDGE_GAP (seconds, default 8), DUP_EMBED_BATCH (default 50)
+#                   DUP_OLD_MAX (default 3000), DUP_JUDGE_GAP (seconds, default 8), DUP_EMBED_BATCH (default 50),
+#                   DUP_JUDGE_TOKENS (default 1500)
 # Settings in bot_settings (changed in the database, no code edit): dup_hi, dup_lo, dup_auto, dup_ai_budget,
 #                   dup_old_ai_budget; dup_old_done is written by the code (the «all old checked» message went out)
 
@@ -60,6 +65,10 @@ CAND_LIMIT = 5           # nearest neighbours asked from the database per event
 FILL_PER_EVENT = 20      # old events of the same day+city that get a vector alongside one new event
 EMBED_TIMEOUT = 30
 EMBED_BATCH = max(1, _env_int('DUP_EMBED_BATCH', 50))   # texts per Cloudflare request in run_old()
+# The answer itself is ~30 tokens, but gpt-oss-120b reasons before answering and the reasoning counts toward the
+# same ceiling: with 200 (v1–v3) Groq kept returning an empty or half-written JSON and every pair fell through to
+# the slower reserve. A ceiling is not spent unless used, so a high one costs nothing.
+JUDGE_MAX_TOKENS = _env_int('DUP_JUDGE_TOKENS', 1500)
 
 DUP_SCREEN_LINK = 'https://t.me/weekendy_add_bot?start=dup'   # opens «🧩 Дубли» (add v83)
 
@@ -219,7 +228,7 @@ def _ask_judge(a: dict, b: dict):
         if client is None:
             continue
         try:
-            response = _chat(provider, client, model, prompt, 200, 0.0, False)
+            response = _chat(provider, client, model, prompt, JUDGE_MAX_TOKENS, 0.0, False)
             raw = _strip_fence(response.choices[0].message.content or '')
             data = json.loads(raw)
             same = bool(data.get('same'))
