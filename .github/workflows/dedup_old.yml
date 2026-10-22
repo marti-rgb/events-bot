@@ -1,0 +1,40 @@
+name: Dedup Old Events
+# ВЕРСИЯ v1 — 22.10.2026
+# v1 — task 56: daily duplicate check of old events (dedup_old.py → dedup.run_old). Runs at 10:00 UTC = 13:00 МСК,
+#      when the parser (01:00 UTC start, 350 min limit) has surely finished. «Run workflow» starts it by hand.
+#      Same secrets as Parse Events, nothing new. DUP_ON=0 turns it off together with the parser's check.
+on:
+  schedule:
+    - cron: '0 10 * * *'
+  workflow_dispatch:
+jobs:
+  dedup-old:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: dedup-old
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install psycopg2-binary==2.9.9
+      - name: Check old events for duplicates
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_AI_TOKEN: ${{ secrets.CF_AI_TOKEN }}
+          DUP_ON: ${{ vars.DUP_ON || '1' }}
+          DUP_MODEL: ${{ vars.DUP_MODEL || '@cf/baai/bge-m3' }}
+          DUP_OLD_MAX: ${{ vars.DUP_OLD_MAX || '3000' }}
+          DUP_JUDGE_GAP: ${{ vars.DUP_JUDGE_GAP || '8' }}
+        run: python dedup_old.py
