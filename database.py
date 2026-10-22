@@ -1,11 +1,13 @@
-# database.py — v5 (имя файла не меняется: его импортирует parser.py)
+# database.py — v6 (имя файла не меняется: его импортирует parser.py)
+# v6 — task 56, old events: list/count of future events never checked for duplicates, bulk vector save,
+#      find_dup_candidates(only_checked=…) so every pair is looked at once, a pair already sharing a group is
+#      never offered again, a pair is not offered if it would put two different times into one waiting group,
+#      past waiting groups are closed (status 'expired'), setting dup_old_ai_budget, get_setting/set_setting.
+#      No schema change; the dup_old_ai_budget row is block 1 of migration_20261022_dup_old.sql. Updated 22.10.2026
 # v5 — task 56 (semantic duplicates): save_event() returns the new event id instead of True/False, plus the
 #      database side of dedup.py — vectors (event_vectors), candidate search inside the same day + city,
 #      groups for manual review (dup_groups / dup_group_items) and the «кого оставить» rule.
 #      Needs migration_20261021_dup.sql. Updated 21.10.2026
-# v4 — ON CONFLICT matches the new partial unique index events_source_url_uq (migration_20261015_dup_mod.sql):
-#      an event deleted by its author (ignored_reason = 'manual') no longer holds its post link, so the parser may
-#      pick the same post up again. MUST be deployed together with that migration. Updated 15.10.2026
 #
 # История версий (старше двух последних) — в versions_history.md
 import os
@@ -310,13 +312,18 @@ def has_session_today() -> bool:
 #   dup_group_items (group_id, event_id, score, by_ai, reason, hidden)
 #   bot_settings: dup_hi, dup_lo, dup_auto, dup_ai_budget
 
-DUP_DEFAULTS = {'dup_hi': 0.93, 'dup_lo': 0.80, 'dup_auto': 'off', 'dup_ai_budget': 50}
+DUP_DEFAULTS = {'dup_hi': 0.93, 'dup_lo': 0.80, 'dup_auto': 'off', 'dup_ai_budget': 50,
+                'dup_old_ai_budget': 100}
+
+# The same «today» the add-bot and cleanup_event_vectors() use: events.date is text 'YYYY-MM-DD', Moscow time.
+_TODAY_MSK = "to_char(now() AT TIME ZONE 'Europe/Moscow', 'YYYY-MM-DD')"
 
 
 def get_dup_settings() -> dict:
     """Thresholds and switches, read once per run. Any missing or broken value falls back to the default."""
     out = {'hi': DUP_DEFAULTS['dup_hi'], 'lo': DUP_DEFAULTS['dup_lo'],
-           'auto': False, 'ai_budget': DUP_DEFAULTS['dup_ai_budget']}
+           'auto': False, 'ai_budget': DUP_DEFAULTS['dup_ai_budget'],
+           'old_ai_budget': DUP_DEFAULTS['dup_old_ai_budget']}
     try:
         conn = get_conn()
     except Exception as e:
@@ -336,6 +343,10 @@ def get_dup_settings() -> dict:
             pass
         try:
             out['ai_budget'] = max(0, int(raw.get('dup_ai_budget', DUP_DEFAULTS['dup_ai_budget'])))
+        except ValueError:
+            pass
+        try:
+            out['old_ai_budget'] = max(0, int(raw.get('dup_old_ai_budget', DUP_DEFAULTS['dup_old_ai_budget'])))
         except ValueError:
             pass
         out['auto'] = raw.get('dup_auto', 'off').lower() in ('1', 'on', 'true', 'yes')
@@ -372,6 +383,33 @@ def save_event_vector(event_id: int, vec, model: str) -> bool:
         conn.rollback()
         logging.error(f"save_event_vector error (event {event_id}): {e}")
         return False
+    finally:
+        conn.close()
+
+
+def save_event_vectors_bulk(rows: list, model: str) -> int:
+    """v6: many vectors in one connection — the old-events check builds hundreds at once.
+    rows = [(event_id, vec), …]. Returns how many were saved (0 on any failure: the caller just skips them)."""
+    if not rows:
+        return 0
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"save_event_vectors_bulk connect error: {e}")
+        return 0
+    c = conn.cursor()
+    try:
+        c.executemany('''
+            INSERT INTO event_vectors (event_id, vec, model)
+            VALUES (%s, %s::vector, %s)
+            ON CONFLICT (event_id) DO UPDATE SET vec = excluded.vec, model = excluded.model, built_at = now()
+        ''', [(eid, _vec_literal(vec), model) for eid, vec in rows])
+        conn.commit()
+        return len(rows)
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"save_event_vectors_bulk error: {e}")
+        return 0
     finally:
         conn.close()
 
@@ -428,10 +466,13 @@ def find_events_without_vector(day: str, city, limit: int) -> list:
         conn.close()
 
 
-def find_dup_candidates(event_id: int, limit: int, min_score: float) -> list:
+def find_dup_candidates(event_id: int, limit: int, min_score: float, only_checked: bool = False) -> list:
     """Nearest events by meaning inside the same day and city.
-    Skipped: other time (unless one of the two has none), rows of the same post, pairs the admin already
-    called «не дубли», and everything hidden from search."""
+    Skipped: other time (unless one of the two has none), rows of the same post, pairs that already share a
+    group (waiting, decided, «не дубли» or taken out by the admin — v6: any group, so no pair is judged twice),
+    and everything hidden from search.
+    only_checked (v6, old-events check): only neighbours already checked for duplicates. Two unchecked events
+    meet once — when the second of them is checked, the first one is already marked."""
     try:
         conn = get_conn()
     except Exception as e:
@@ -466,16 +507,36 @@ def find_dup_candidates(event_id: int, limit: int, min_score: float) -> list:
                     SELECT 1
                     FROM dup_group_items a
                     JOIN dup_group_items b ON b.group_id = a.group_id
-                    JOIN dup_groups g ON g.id = a.group_id
                     WHERE a.event_id = me.id AND b.event_id = e.id
-                      AND (g.status = 'rejected'
-                           OR COALESCE(a.reason, '') = 'excluded'
-                           OR COALESCE(b.reason, '') = 'excluded')
               )
+              -- v6: «другое время — не дубль» must hold for the whole group, not only for the pair. A pair joins
+              -- the waiting group of either side, so neither side may bring a time that differs from a time
+              -- already in the other side's group (mafia 19:00 and 21:00 next to a post without time).
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM dup_group_items gi
+                    JOIN dup_groups gg ON gg.id = gi.group_id AND gg.status = 'wait'
+                    JOIN dup_group_items gj ON gj.group_id = gi.group_id AND COALESCE(gj.reason, '') <> 'excluded'
+                    JOIN events ej ON ej.id = gj.event_id
+                    WHERE gi.event_id = e.id
+                      AND me.tm IS NOT NULL
+                      AND NULLIF(ej.time, '') IS NOT NULL AND NULLIF(ej.time, '') <> me.tm
+              )
+              AND NOT EXISTS (
+                    SELECT 1
+                    FROM dup_group_items mi
+                    JOIN dup_groups mg ON mg.id = mi.group_id AND mg.status = 'wait'
+                    JOIN dup_group_items mj ON mj.group_id = mi.group_id AND COALESCE(mj.reason, '') <> 'excluded'
+                    JOIN events ek ON ek.id = mj.event_id
+                    WHERE mi.event_id = me.id
+                      AND NULLIF(e.time, '') IS NOT NULL
+                      AND NULLIF(ek.time, '') IS NOT NULL AND NULLIF(ek.time, '') <> NULLIF(e.time, '')
+              )
+              AND (%s = false OR e.dup_checked_at IS NOT NULL)
               AND (1 - (v.vec <=> me.vec)) >= %s
             ORDER BY v.vec <=> me.vec
             LIMIT %s
-        """, (event_id, min_score, limit))
+        """, (event_id, bool(only_checked), min_score, limit))
         return [dict(row) for row in c.fetchall()]
     except Exception as e:
         logging.error(f"find_dup_candidates error (event {event_id}): {e}")
@@ -638,5 +699,128 @@ def mark_dup_checked(event_id: int):
     except Exception as e:
         conn.rollback()
         logging.error(f"mark_dup_checked error: {e}")
+    finally:
+        conn.close()
+
+
+# ===== v6: old events (task 56) — everything that was in the base before the duplicate check existed =====
+# «Old» = a future event, visible in search (or waiting in the 3-day queue), never checked: dup_checked_at is
+# empty. The parser marks its new events itself, so after the first full pass only add-bot events and the
+# events the parser could not finish (judge budget, Cloudflare down) show up here.
+_OLD_WHERE = f"""
+    e.dup_checked_at IS NULL
+    AND COALESCE(e.date, '') <> ''
+    AND e.date >= {_TODAY_MSK}
+    AND (COALESCE(e.is_ignored, false) = false OR e.ignored_reason = 'queue')
+"""
+
+
+def list_old_unchecked(limit: int) -> list:
+    """Nearest dates first: those leave the base soonest and matter to users right now."""
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"list_old_unchecked connect error: {e}")
+        return []
+    c = conn.cursor()
+    try:
+        c.execute(f"""
+            SELECT e.id, e.title, e.date, e.time, e.location, e.address, e.price, e.description,
+                   COALESCE(NULLIF(e.city_parsed->>0, ''), NULLIF(e.city, '')) AS city,
+                   (v.event_id IS NOT NULL) AS has_vec
+            FROM events e
+            LEFT JOIN event_vectors v ON v.event_id = e.id
+            WHERE {_OLD_WHERE}
+            ORDER BY e.date, e.id
+            LIMIT %s
+        """, (limit,))
+        return [dict(row) for row in c.fetchall()]
+    except Exception as e:
+        logging.error(f"list_old_unchecked error: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+def count_old_unchecked():
+    """None if the base did not answer — the report then says «не удалось посчитать», not «0»."""
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"count_old_unchecked connect error: {e}")
+        return None
+    c = conn.cursor()
+    try:
+        c.execute(f"SELECT count(*) AS n FROM events e WHERE {_OLD_WHERE}")
+        return int(c.fetchone()['n'])
+    except Exception as e:
+        logging.error(f"count_old_unchecked error: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+def expire_past_dup_groups() -> int:
+    """Groups whose day has passed and nobody decided: status 'expired'. Events are not touched.
+    The add-bot shows only status 'wait', so the «🧩 Дубли (N)» counter stops growing with dead groups."""
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"expire_past_dup_groups connect error: {e}")
+        return 0
+    c = conn.cursor()
+    try:
+        c.execute(f"""
+            UPDATE dup_groups SET status = 'expired', decided_at = now()
+            WHERE status = 'wait' AND COALESCE(day, '') <> '' AND day < {_TODAY_MSK}
+            RETURNING id
+        """)
+        n = len(c.fetchall())
+        conn.commit()
+        return n
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"expire_past_dup_groups error: {e}")
+        return 0
+    finally:
+        conn.close()
+
+
+def get_setting(key: str, default=None):
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"get_setting connect error: {e}")
+        return default
+    c = conn.cursor()
+    try:
+        c.execute('SELECT value FROM bot_settings WHERE key = %s', (key,))
+        row = c.fetchone()
+        return row['value'] if row and row['value'] is not None else default
+    except Exception as e:
+        logging.error(f"get_setting error ({key}): {e}")
+        return default
+    finally:
+        conn.close()
+
+
+def set_setting(key: str, value: str) -> bool:
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"set_setting connect error: {e}")
+        return False
+    c = conn.cursor()
+    try:
+        c.execute('''
+            INSERT INTO bot_settings (key, value) VALUES (%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value = excluded.value
+        ''', (key, value))
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"set_setting error ({key}): {e}")
+        return False
     finally:
         conn.close()

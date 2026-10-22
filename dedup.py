@@ -1,14 +1,32 @@
-# dedup.py — v1
+# dedup.py — v2
+# v2 — task 56, old events + fixes (22.10.2026):
+#      1) run_old(): the daily check of events that were in the base before the duplicate check existed (and of
+#         add-bot events, which nobody checked). Vectors for all of them, then nearest dates first, each compared
+#         only with neighbours already checked — every pair is looked at once. Own judge budget dup_old_ai_budget.
+#         Started by dedup_old.py (GitHub workflow dedup_old.yml), not by the parser.
+#      2) A pair whose grey part could not be judged (budget spent) no longer marks the event as checked —
+#         «осталось на завтра» is now true: run_old() picks such events up the next day.
+#      3) Giveaway ≠ announcement: if exactly one of the two titles is a giveaway («Розыгрыш…», «Дарим…»), it is
+#         not a duplicate, the judge is not asked — works above dup_hi too. The judge prompt got the same rule.
+#      4) Pause between judge questions (DUP_JUDGE_GAP, 8 s): Groq free gpt-oss-120b allows 8K tokens a minute.
+#      5) Past waiting groups are closed (status 'expired') by run_old(); the reports carry a link that opens the
+#         add-bot screen (?start=dup, add v83); the report names which judge models answered.
+#      Needs database.py v6.
 # v1 — task 56: semantic duplicates for the parser. Embeddings via Cloudflare Workers AI, candidates inside the
 #      same day + city, AI judge for the grey band, groups for manual review in the add-bot. Nothing is hidden
 #      while bot_settings.dup_auto is off. Created 21.10.2026
 #
 # GitHub secrets:   CF_ACCOUNT_ID, CF_AI_TOKEN
-# GitHub variables: DUP_ON (1/0, default 1), DUP_MODEL (default @cf/baai/bge-m3), DUP_FILL_MAX (default 400)
-# Settings in bot_settings (changed in the database, no code edit): dup_hi, dup_lo, dup_auto, dup_ai_budget
+# GitHub variables: DUP_ON (1/0, default 1), DUP_MODEL (default @cf/baai/bge-m3), DUP_FILL_MAX (default 400),
+#                   DUP_OLD_MAX (default 3000), DUP_JUDGE_GAP (seconds, default 8), DUP_EMBED_BATCH (default 50)
+# Settings in bot_settings (changed in the database, no code edit): dup_hi, dup_lo, dup_auto, dup_ai_budget,
+#                   dup_old_ai_budget; dup_old_done is written by the code (the «all old checked» message went out)
 
 import os
+import re
 import json
+import time
+import asyncio
 import logging
 
 import httpx
@@ -21,16 +39,30 @@ CF_AI_TOKEN = (os.getenv('CF_AI_TOKEN') or '').strip()
 DUP_MODEL = (os.getenv('DUP_MODEL') or '@cf/baai/bge-m3').strip()
 DUP_ON = (os.getenv('DUP_ON', '1') or '1').strip().lower() in ('1', 'true', 'yes', 'on')
 
-try:
-    DUP_FILL_MAX = int(os.getenv('DUP_FILL_MAX', '400') or 400)
-except ValueError:
-    DUP_FILL_MAX = 400
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)) or default)
+    except ValueError:
+        return default
+
+
+DUP_FILL_MAX = _env_int('DUP_FILL_MAX', 400)
+DUP_OLD_MAX = _env_int('DUP_OLD_MAX', 3000)      # old events looked at in one run_old()
+JUDGE_GAP = _env_int('DUP_JUDGE_GAP', 8)         # seconds between two judge questions
 
 DESC_CHARS = 600         # how much of the description goes into the vector
 JUDGE_DESC_CHARS = 300   # how much of the description goes to the judge
-CAND_LIMIT = 5           # nearest neighbours asked from the database per new event
+CAND_LIMIT = 5           # nearest neighbours asked from the database per event
 FILL_PER_EVENT = 20      # old events of the same day+city that get a vector alongside one new event
 EMBED_TIMEOUT = 30
+EMBED_BATCH = max(1, _env_int('DUP_EMBED_BATCH', 50))   # texts per Cloudflare request in run_old()
+
+DUP_SCREEN_LINK = 'https://t.me/weekendy_add_bot?start=dup'   # opens «🧩 Дубли» (add v83)
+
+# Giveaway post vs the plain announcement of the same show: for a viewer these are two different things.
+# Only the TITLE is looked at — a festival description may mention «розыгрыш призов» in its programme.
+GIVEAWAY_TITLE_RE = re.compile(r'розыгрыш|разыгр|giveaway|\bдарим\b', re.IGNORECASE)
 
 # The judge: the strongest free model first. 4.5 is last on purpose — it is known to answer
 # differently on identical text (exhibition «Искусство сцены», 32 copies).
@@ -44,6 +76,7 @@ JUDGE_PROMPT = """Два анонса мероприятий из разных T
 
 ОДНО И ТО ЖЕ — один и тот же сеанс: та же площадка, то же время, то же событие, просто описано разными словами.
 РАЗНЫЕ — разные сеансы одного спектакля, разные части цикла, разные площадки, разные программы.
+РАЗНЫЕ — если один пост про розыгрыш билетов, конкурс или подарок, а другой — обычный анонс, даже если сеанс тот же.
 
 Ответь ТОЛЬКО JSON, без пояснений и без markdown:
 {"same": true/false, "why": "одна короткая фраза по-русски, не больше 12 слов"}
@@ -54,9 +87,9 @@ JUDGE_PROMPT = """Два анонса мероприятий из разных T
 Мероприятие B:
 %(b)s"""
 
-# Counters and problems of the current run (read by finish_run()).
+# Counters and problems of the current run (read by finish_run() / run_old()).
 STATS = {
-    'checked': 0,      # new events that went through the check
+    'checked': 0,      # events that went through the check (and were marked)
     'vectors': 0,      # vectors computed (new events + backfill)
     'filled': 0,       # vectors computed for events that were already in the base
     'pairs_hi': 0,     # pairs above dup_hi — duplicates without asking the AI
@@ -64,15 +97,22 @@ STATS = {
     'judged': 0,       # grey pairs actually sent to the judge
     'judged_yes': 0,
     'grey_left': 0,    # grey pairs left for the next run (budget spent)
+    'giveaway': 0,     # pairs skipped: giveaway vs announcement
     'groups_new': 0,
     'groups_join': 0,
     'hidden': 0,       # hidden right away (only while dup_auto is on)
     'errors': 0,
+    # run_old() only
+    'old_seen': 0,     # old events taken into this run
+    'old_kept': 0,     # left unchecked for tomorrow (budget spent or no vector)
+    'expired': 0,      # past waiting groups closed
 }
+JUDGE_MODELS = {}      # which model answered how many times
 PROBLEMS = []          # one line per problem kind, shown to the admin once per run
 
 _settings = None
 _off_reason = None     # set once when the whole module turns itself off for this run
+_last_judge_at = 0.0
 
 
 def _problem(kind: str, text: str):
@@ -91,7 +131,7 @@ def settings() -> dict:
         _settings = db.get_dup_settings()
         logging.info(f"Дедуп: пороги {_settings['lo']}–{_settings['hi']}, "
                      f"авторежим {'вкл' if _settings['auto'] else 'выкл'}, "
-                     f"бюджет судьи {_settings['ai_budget']}")
+                     f"бюджет судьи {_settings['ai_budget']} (старые {_settings['old_ai_budget']})")
     return _settings
 
 
@@ -128,6 +168,10 @@ def judge_text(ev: dict) -> str:
         f"Описание: {(ev.get('description') or '').strip()[:JUDGE_DESC_CHARS]}",
     ]
     return '\n'.join(rows)
+
+
+def is_giveaway(ev: dict) -> bool:
+    return bool(GIVEAWAY_TITLE_RE.search(ev.get('title') or ''))
 
 
 async def embed(texts: list[str]) -> list[list[float]] | None:
@@ -176,12 +220,27 @@ def _ask_judge(a: dict, b: dict):
             data = json.loads(raw)
             same = bool(data.get('same'))
             why = (data.get('why') or '').strip()[:200]
-            return same, why, f"{provider}/{model}"
+            name = f"{provider}/{model}"
+            JUDGE_MODELS[name] = JUDGE_MODELS.get(name, 0) + 1
+            return same, why, name
         except Exception as e:
             logging.warning(f"Дедуп, судья {provider}/{model} не ответил: {e}")
             continue
     _problem('Судья', 'ни одна модель не ответила на вопрос о дубле — пары ждут следующего прогона')
     return None, '', ''
+
+
+async def _judge(a: dict, b: dict):
+    """v2: keeps JUDGE_GAP seconds between questions. In the parser the posts themselves take ~15 s,
+    so it almost never waits there; in run_old() the questions would otherwise go back to back."""
+    global _last_judge_at
+    wait = JUDGE_GAP - (time.monotonic() - _last_judge_at)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    try:
+        return _ask_judge(a, b)
+    finally:
+        _last_judge_at = time.monotonic()
 
 
 async def _fill_missing_vectors(day: str, city: str):
@@ -201,6 +260,54 @@ async def _fill_missing_vectors(day: str, city: str):
             STATS['filled'] += 1
 
 
+async def _check_pairs(event_id: int, ev: dict, day: str, city, budget: int, only_checked: bool) -> bool:
+    """Looks for this event's duplicate among its neighbours and puts the pair into a group.
+    Returns False when a grey pair had to be skipped (judge budget spent, or no judge answered) —
+    the event then stays unchecked and run_old() comes back to it the next day."""
+    st = settings()
+    complete = True
+    candidates = db.find_dup_candidates(event_id, CAND_LIMIT, st['lo'], only_checked)
+    for cand in candidates:
+        if is_giveaway(ev) != is_giveaway(cand):
+            STATS['giveaway'] += 1
+            continue
+        score = float(cand.get('score') or 0)
+        by_ai = False
+        reason = ''
+        if score >= st['hi']:
+            STATS['pairs_hi'] += 1
+            reason = f"похожесть {score:.2f}"
+        elif score >= st['lo']:
+            STATS['pairs_grey'] += 1
+            if STATS['judged'] >= budget:
+                STATS['grey_left'] += 1
+                complete = False
+                continue
+            STATS['judged'] += 1
+            same, why, model = await _judge(ev, cand)
+            if same is None:
+                complete = False
+                continue
+            if not same:
+                continue
+            STATS['judged_yes'] += 1
+            by_ai = True
+            reason = why or f"нейросеть: одно и то же ({model})"
+        else:
+            continue
+
+        joined, group_id = db.create_or_join_group(day, city, event_id, cand['id'], score, by_ai, reason)
+        if not group_id:
+            complete = False
+            continue
+        STATS['groups_join' if joined else 'groups_new'] += 1
+        if st['auto']:
+            STATS['hidden'] += db.hide_losers(group_id)
+        # one duplicate per event is enough: the rest of the group is found through the group itself
+        return True
+    return complete
+
+
 async def process(event_id: int, ev: dict):
     """Called by the parser right after an event was saved. Never raises: the parser must not stop because of dubles."""
     if not enabled() or not event_id:
@@ -217,46 +324,21 @@ async def process(event_id: int, ev: dict):
             return
         if not db.save_event_vector(event_id, vecs[0], DUP_MODEL):
             return
-        STATS['checked'] += 1
 
         await _fill_missing_vectors(day, city)
 
-        candidates = db.find_dup_candidates(event_id, CAND_LIMIT, st['lo'])
-        for cand in candidates:
-            score = float(cand.get('score') or 0)
-            by_ai = False
-            reason = ''
-            if score >= st['hi']:
-                STATS['pairs_hi'] += 1
-                reason = f"похожесть {score:.2f}"
-            elif score >= st['lo']:
-                STATS['pairs_grey'] += 1
-                if STATS['judged'] >= st['ai_budget']:
-                    STATS['grey_left'] += 1
-                    continue
-                STATS['judged'] += 1
-                same, why, model = _ask_judge(ev, cand)
-                if not same:
-                    continue
-                STATS['judged_yes'] += 1
-                by_ai = True
-                reason = why or f"нейросеть: одно и то же ({model})"
-            else:
-                continue
-
-            joined, group_id = db.create_or_join_group(day, city, event_id, cand['id'], score, by_ai, reason)
-            if not group_id:
-                continue
-            STATS['groups_join' if joined else 'groups_new'] += 1
-            if st['auto']:
-                STATS['hidden'] += db.hide_losers(group_id)
-            # one duplicate per event is enough: the rest of the group is found through the group itself
-            break
-
-        db.mark_dup_checked(event_id)
+        if await _check_pairs(event_id, ev, day, city, st['ai_budget'], only_checked=False):
+            STATS['checked'] += 1
+            db.mark_dup_checked(event_id)
     except Exception as e:
         logging.error(f"dedup.process error (event {event_id}): {e}")
         _problem('Дедуп', f'сбой проверки мероприятия {event_id}: {e}')
+
+
+def _judge_models_text() -> str:
+    if not JUDGE_MODELS:
+        return ''
+    return '; судья: ' + ', '.join(f"{k.split('/', 1)[-1]} {v}" for k, v in JUDGE_MODELS.items())
 
 
 def report_line() -> str:
@@ -266,7 +348,9 @@ def report_line() -> str:
             f"спорных {STATS['pairs_grey']} (разобрано судьёй {STATS['judged']}, "
             f"из них дубли {STATS['judged_yes']}, осталось на завтра {STATS['grey_left']}), "
             f"групп новых {STATS['groups_new']}, дописано в старые {STATS['groups_join']}"
-            + (f", скрыто автоматом {STATS['hidden']}" if STATS['hidden'] else ''))
+            + (f", розыгрыш≠анонс {STATS['giveaway']}" if STATS['giveaway'] else '')
+            + (f", скрыто автоматом {STATS['hidden']}" if STATS['hidden'] else '')
+            + _judge_models_text())
 
 
 async def finish_run(notify):
@@ -278,4 +362,99 @@ async def finish_run(notify):
     if PROBLEMS:
         await notify("⚠️ Дубли: " + "\n".join(PROBLEMS) + f"\n\n{line}\nМероприятия сохранялись как обычно.")
     elif STATS['groups_new'] or STATS['groups_join']:
-        await notify(line + "\n\nПосмотреть и подтвердить — в add-боте, «🧩 Дубли».")
+        await notify(line + f"\n\nПосмотреть и подтвердить: {DUP_SCREEN_LINK}")
+
+
+# ===== v2: old events =====
+
+async def _old_vectors(rows: list) -> set:
+    """Vectors for old events that have none, in batches. Returns the ids that have a vector afterwards."""
+    ready = {r['id'] for r in rows if r.get('has_vec')}
+    todo = [r for r in rows if not r.get('has_vec')]
+    for i in range(0, len(todo), EMBED_BATCH):
+        part = todo[i:i + EMBED_BATCH]
+        vecs = await embed([event_text(r) for r in part])
+        if not vecs:
+            break   # Cloudflare refused — the problem is already noted; the rest waits for tomorrow
+        saved = db.save_event_vectors_bulk([(r['id'], v) for r, v in zip(part, vecs)], DUP_MODEL)
+        if saved:
+            STATS['filled'] += saved
+            ready.update(r['id'] for r in part)
+        else:
+            _problem('База', 'векторы старых мероприятий не сохранились — проверка продолжится завтра')
+            break
+    return ready
+
+
+def old_report_line(left) -> str:
+    left_txt = 'не удалось посчитать' if left is None else str(left)
+    return (f"🧩 Дубли среди старых: проверено {STATS['checked']}, осталось {left_txt}; "
+            f"векторов {STATS['vectors']}, явных пар {STATS['pairs_hi']}, "
+            f"спорных {STATS['pairs_grey']} (разобрано судьёй {STATS['judged']}, "
+            f"из них дубли {STATS['judged_yes']}, на завтра {STATS['grey_left']}), "
+            f"групп новых {STATS['groups_new']}, дописано в старые {STATS['groups_join']}"
+            + (f", розыгрыш≠анонс {STATS['giveaway']}" if STATS['giveaway'] else '')
+            + (f", скрыто автоматом {STATS['hidden']}" if STATS['hidden'] else '')
+            + (f", закрыто прошедших групп {STATS['expired']}" if STATS['expired'] else '')
+            + _judge_models_text())
+
+
+async def run_old(notify):
+    """The daily check of old events (dedup_old.py). Never raises."""
+    if not DUP_ON:
+        logging.info("DUP_ON=0 — проверка старых выключена")
+        return
+    try:
+        if not enabled():
+            await notify("⚠️ Дубли среди старых: " + "\n".join(PROBLEMS))
+            return
+        st = settings()
+        STATS['expired'] = db.expire_past_dup_groups()
+
+        rows = db.list_old_unchecked(DUP_OLD_MAX)
+        STATS['old_seen'] = len(rows)
+        logging.info(f"Старые без проверки: взято {len(rows)}")
+        ready = await _old_vectors(rows) if rows else set()
+
+        for row in rows:
+            if row['id'] not in ready:
+                STATS['old_kept'] += 1
+                continue
+            day = (row.get('date') or '').strip()
+            try:
+                if await _check_pairs(row['id'], row, day, row.get('city'), st['old_ai_budget'], only_checked=True):
+                    STATS['checked'] += 1
+                    db.mark_dup_checked(row['id'])
+                else:
+                    STATS['old_kept'] += 1
+            except Exception as e:
+                STATS['old_kept'] += 1
+                logging.error(f"dedup.run_old error (event {row['id']}): {e}")
+                _problem('Дедуп', f'сбой проверки мероприятия {row["id"]}: {e}')
+
+        left = db.count_old_unchecked()
+        line = old_report_line(left)
+        logging.info(line)
+
+        # One message per run at most. During the first full pass — progress every day; after it — only when
+        # something was found or broke. «All checked» is said once (bot_settings.dup_old_done).
+        done_before = (db.get_setting('dup_old_done', '') or '') != ''
+        finished_now = left == 0 and not done_before
+        if finished_now:
+            db.set_setting('dup_old_done', time.strftime('%Y-%m-%d'))
+        found = STATS['groups_new'] or STATS['groups_join']
+        text = ''
+        if PROBLEMS:
+            text = "⚠️ Дубли среди старых: " + "\n".join(PROBLEMS) + f"\n\n{line}"
+        elif found or finished_now or (not done_before and STATS['checked']):
+            text = line
+        if text and found:
+            text += f"\n\nПосмотреть и подтвердить: {DUP_SCREEN_LINK}"
+        if text and finished_now:
+            text += ("\n\n✅ Все старые мероприятия проверены на дубли. Дальше проверка идёт сама каждый день "
+                     "и пишет, только если что-то нашла или что-то сломалось.")
+        if text:
+            await notify(text)
+    except Exception as e:
+        logging.error(f"dedup.run_old crashed: {e}")
+        await notify(f"⚠️ Дубли среди старых: проверка упала — {e}")
