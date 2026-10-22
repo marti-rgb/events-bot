@@ -1,14 +1,15 @@
-# database.py — v8 (имя файла не меняется: его импортирует parser.py)
+# database.py — v9 (имя файла не меняется: его импортирует parser.py)
+# v9 — task 56, «кого оставить»: a start time is now the second step, right after «от организатора», and the four
+#      remaining fields (price, address, photo, registration link) are COUNTED instead of being a strict ladder —
+#      a card with only an address no longer beats a card with a time, a price and a photo. Reason behind the time
+#      step: search orders a day by start time and puts cards without one at the end of the day, so keeping such a
+#      card buried the whole event («Октоберфест» 23.10, 8 copies). The reason shown is now the step that really
+#      decided, found by narrowing the field (pick_keep) — «от организатора», «указано время», «заполнена полнее»,
+#      «описание подробнее», «добавлено позже». Same list in the add-bot v85. No migration. Updated 22.10.2026
 # v8 — task 56: the «кого оставить» reason knows the description rule. A card that won because its description is
 #      the longest one in the group used to be labelled «добавлено позже» (the last branch), which contradicted the
 #      visible ids — the choice was right, the explanation wasn't. New reason «описание подробнее»; the rule order
 #      itself is unchanged. The same branch was added to the add-bot (v84). No migration. Updated 22.10.2026
-# v7 — task 56: create_or_join_group() merges two waiting groups when a pair links them (piles 1+2 and 3+4 of
-#      the same event used to stay apart and each kept its own survivor) and returns a dict with the members;
-#      an 'excluded' row is never brought back by a merge or a re-pair; the time rule now compares my side's
-#      times with the candidate side's (mine + my waiting groups vs its + its groups); a stale «оставляем» mark
-#      is cleared when the survivor changes; record_not_dup() keeps the judge's «разные» as a closed pair so it is
-#      never asked twice. New dup_groups.status 'merged' and 'ai_no'. Needs dedup.py v3. Updated 22.10.2026
 #
 # История версий (старше двух последних) — в versions_history.md
 import os
@@ -551,56 +552,60 @@ def find_dup_candidates(event_id: int, limit: int, min_score: float, only_checke
         conn.close()
 
 
-# Which one stays, in the order agreed with the user: organizer → price → address → photo → registration
-# link → longer description → added later. The first line is also the human-readable reason.
-_KEEP_ORDER = """
-    (added_by_user IS NOT NULL) DESC,
-    (COALESCE(NULLIF(price, ''), '') <> '') DESC,
-    (COALESCE(NULLIF(address, ''), '') <> '') DESC,
-    (COALESCE(NULLIF(photo_id, ''), '') <> '' OR media_message_id IS NOT NULL) DESC,
-    (COALESCE(NULLIF(reg_link, ''), '') <> '') DESC,
-    length(COALESCE(description, '')) DESC,
-    created_at DESC,
-    id DESC
-"""
+# Which one stays (order agreed with the user, 22.10): organizer → has a start time → more of the four fields
+# filled (price, address, photo, registration link) → longer description → added later. The start time is a step
+# of its own because search sorts a day by it and puts the cards WITHOUT a time at the end of that day — keeping
+# such a card as the survivor would bury the whole event (task 17, 04.10).
+# The reason shown is the step that actually decided: the first one where a single card was left standing.
+# The same list, in the same order, lives in the add-bot (dupPick) — change both together.
+def _keep_fullness(r) -> int:
+    return sum(1 for v in (
+        (r.get('price') or '').strip(),
+        (r.get('address') or '').strip(),
+        (r.get('photo_id') or '').strip() or r.get('media_message_id'),
+        (r.get('reg_link') or '').strip(),
+    ) if v)
+
+
+_KEEP_CRITERIA = [
+    ('от организатора',    lambda r: 1 if r.get('added_by_user') is not None else 0),
+    ('указано время',      lambda r: 1 if (r.get('time') or '').strip() else 0),
+    ('заполнена полнее',   _keep_fullness),
+    ('описание подробнее', lambda r: len(r.get('description') or '')),
+    ('добавлено позже',    lambda r: r['created_at'].timestamp() if r.get('created_at') else 0),
+    ('добавлено позже',    lambda r: r['id']),
+]
+
+
+def pick_keep(rows: list):
+    """(row, why) — the survivor and the step that decided. Narrows the field criterion by criterion: whoever is
+    best at a step stays, and the step on which one card is left is the one named as the reason."""
+    rows = [r for r in rows if r]
+    if not rows:
+        return None, ''
+    if len(rows) == 1:
+        return rows[0], 'осталась одна'
+    for why, key in _KEEP_CRITERIA:
+        best = max(key(r) for r in rows)
+        top = [r for r in rows if key(r) == best]
+        if len(top) == 1:
+            return top[0], why
+        rows = top
+    return rows[0], 'добавлено позже'
 
 
 def _recompute_keep(c, group_id: int):
     """Picks the survivor of the group and writes a short reason into dup_groups.keep_id / items."""
-    c.execute(f"""
-        SELECT id,
-               (added_by_user IS NOT NULL) AS is_org,
-               (COALESCE(NULLIF(price, ''), '') <> '') AS has_price,
-               (COALESCE(NULLIF(address, ''), '') <> '') AS has_addr,
-               (COALESCE(NULLIF(photo_id, ''), '') <> '' OR media_message_id IS NOT NULL) AS has_photo,
-               (COALESCE(NULLIF(reg_link, ''), '') <> '') AS has_link,
-               -- v8: did this card win by the length of its description? (the only one that long, and not empty)
-               (length(COALESCE(description, '')) > 0
-                AND length(COALESCE(description, '')) = max(length(COALESCE(description, ''))) OVER ()
-                AND count(*) OVER (PARTITION BY length(COALESCE(description, ''))) = 1) AS longest_desc
+    c.execute("""
+        SELECT id, added_by_user, time, price, address, photo_id, media_message_id, reg_link,
+               description, created_at
         FROM events
         WHERE id IN (SELECT event_id FROM dup_group_items
                      WHERE group_id = %s AND COALESCE(reason, '') <> 'excluded')
-        ORDER BY {_KEEP_ORDER}
-        LIMIT 1
     """, (group_id,))
-    row = c.fetchone()
+    row, why = pick_keep([dict(r) for r in c.fetchall()])
     if not row:
         return None
-    if row['is_org']:
-        why = 'от организатора'
-    elif row['has_price']:
-        why = 'указана цена'
-    elif row['has_addr']:
-        why = 'указан адрес'
-    elif row['has_photo']:
-        why = 'есть фото'
-    elif row['has_link']:
-        why = 'есть ссылка на регистрацию'
-    elif row['longest_desc']:
-        why = 'описание подробнее'
-    else:
-        why = 'добавлено позже'
     c.execute('UPDATE dup_groups SET keep_id = %s WHERE id = %s', (row['id'], group_id))
     # v7: the survivor may change (a merge, a better card joined) — the old «оставляем: …» mark goes away
     c.execute("""
