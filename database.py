@@ -1,13 +1,15 @@
-# database.py — v6 (имя файла не меняется: его импортирует parser.py)
+# database.py — v7 (имя файла не меняется: его импортирует parser.py)
+# v7 — task 56: create_or_join_group() merges two waiting groups when a pair links them (piles 1+2 and 3+4 of
+#      the same event used to stay apart and each kept its own survivor) and returns a dict with the members;
+#      an 'excluded' row is never brought back by a merge or a re-pair; the time rule now compares my side's
+#      times with the candidate side's (mine + my waiting groups vs its + its groups); a stale «оставляем» mark
+#      is cleared when the survivor changes; record_not_dup() keeps the judge's «разные» as a closed pair so it is
+#      never asked twice. New dup_groups.status 'merged' and 'ai_no'. Needs dedup.py v3. Updated 22.10.2026
 # v6 — task 56, old events: list/count of future events never checked for duplicates, bulk vector save,
 #      find_dup_candidates(only_checked=…) so every pair is looked at once, a pair already sharing a group is
 #      never offered again, a pair is not offered if it would put two different times into one waiting group,
 #      past waiting groups are closed (status 'expired'), setting dup_old_ai_budget, get_setting/set_setting.
 #      No schema change; the dup_old_ai_budget row is block 1 of migration_20261022_dup_old.sql. Updated 22.10.2026
-# v5 — task 56 (semantic duplicates): save_event() returns the new event id instead of True/False, plus the
-#      database side of dedup.py — vectors (event_vectors), candidate search inside the same day + city,
-#      groups for manual review (dup_groups / dup_group_items) and the «кого оставить» rule.
-#      Needs migration_20261021_dup.sql. Updated 21.10.2026
 #
 # История версий (старше двух последних) — в versions_history.md
 import os
@@ -491,6 +493,17 @@ def find_dup_candidates(event_id: int, limit: int, min_score: float, only_checke
                 FROM events e
                 JOIN event_vectors v ON v.event_id = e.id
                 WHERE e.id = %s
+            ),
+            -- v7: every start time on my side — mine and those of my waiting groups (excluded rows don't count)
+            my_times AS (
+                SELECT me.tm AS t FROM me
+                UNION
+                SELECT NULLIF(ek.time, '')
+                FROM me
+                JOIN dup_group_items mi ON mi.event_id = me.id AND COALESCE(mi.reason, '') <> 'excluded'
+                JOIN dup_groups mg ON mg.id = mi.group_id AND mg.status = 'wait'
+                JOIN dup_group_items mj ON mj.group_id = mi.group_id AND COALESCE(mj.reason, '') <> 'excluded'
+                JOIN events ek ON ek.id = mj.event_id
             )
             SELECT e.id, e.title, e.date, e.time, e.location, e.address, e.price, e.description,
                    (1 - (v.vec <=> me.vec)) AS score
@@ -509,28 +522,22 @@ def find_dup_candidates(event_id: int, limit: int, min_score: float, only_checke
                     JOIN dup_group_items b ON b.group_id = a.group_id
                     WHERE a.event_id = me.id AND b.event_id = e.id
               )
-              -- v6: «другое время — не дубль» must hold for the whole group, not only for the pair. A pair joins
-              -- the waiting group of either side, so neither side may bring a time that differs from a time
-              -- already in the other side's group (mafia 19:00 and 21:00 next to a post without time).
+              -- v6/v7: «другое время — не дубль» must hold for the whole group, not only for the pair. A pair
+              -- joins — and since v7 merges — the waiting groups of both sides, so the times on my side and on the
+              -- candidate's side together may hold one start time at most (mafia 19:00 and 21:00 next to a post
+              -- without time; two groups, one at 19:00, the other at 21:00).
               AND NOT EXISTS (
                     SELECT 1
-                    FROM dup_group_items gi
-                    JOIN dup_groups gg ON gg.id = gi.group_id AND gg.status = 'wait'
-                    JOIN dup_group_items gj ON gj.group_id = gi.group_id AND COALESCE(gj.reason, '') <> 'excluded'
-                    JOIN events ej ON ej.id = gj.event_id
-                    WHERE gi.event_id = e.id
-                      AND me.tm IS NOT NULL
-                      AND NULLIF(ej.time, '') IS NOT NULL AND NULLIF(ej.time, '') <> me.tm
-              )
-              AND NOT EXISTS (
-                    SELECT 1
-                    FROM dup_group_items mi
-                    JOIN dup_groups mg ON mg.id = mi.group_id AND mg.status = 'wait'
-                    JOIN dup_group_items mj ON mj.group_id = mi.group_id AND COALESCE(mj.reason, '') <> 'excluded'
-                    JOIN events ek ON ek.id = mj.event_id
-                    WHERE mi.event_id = me.id
-                      AND NULLIF(e.time, '') IS NOT NULL
-                      AND NULLIF(ek.time, '') IS NOT NULL AND NULLIF(ek.time, '') <> NULLIF(e.time, '')
+                    FROM my_times mt,
+                         (SELECT NULLIF(e.time, '') AS t
+                          UNION
+                          SELECT NULLIF(ej.time, '')
+                          FROM dup_group_items gi
+                          JOIN dup_groups gg ON gg.id = gi.group_id AND gg.status = 'wait'
+                          JOIN dup_group_items gj ON gj.group_id = gi.group_id AND COALESCE(gj.reason, '') <> 'excluded'
+                          JOIN events ej ON ej.id = gj.event_id
+                          WHERE gi.event_id = e.id AND COALESCE(gi.reason, '') <> 'excluded') ct
+                    WHERE mt.t IS NOT NULL AND ct.t IS NOT NULL AND mt.t <> ct.t
               )
               AND (%s = false OR e.dup_checked_at IS NOT NULL)
               AND (1 - (v.vec <=> me.vec)) >= %s
@@ -590,6 +597,11 @@ def _recompute_keep(c, group_id: int):
     else:
         why = 'добавлено позже'
     c.execute('UPDATE dup_groups SET keep_id = %s WHERE id = %s', (row['id'], group_id))
+    # v7: the survivor may change (a merge, a better card joined) — the old «оставляем: …» mark goes away
+    c.execute("""
+        UPDATE dup_group_items SET reason = ''
+        WHERE group_id = %s AND event_id <> %s AND COALESCE(reason, '') LIKE 'оставляем:%%'
+    """, (group_id, row['id']))
     c.execute("""
         UPDATE dup_group_items SET reason = %s
         WHERE group_id = %s AND event_id = %s AND COALESCE(reason, '') <> 'excluded'
@@ -598,25 +610,42 @@ def _recompute_keep(c, group_id: int):
 
 
 def create_or_join_group(day: str, city, new_id: int, other_id: int, score: float, by_ai: bool, reason: str):
-    """Returns (joined, group_id). If one of the two already waits in a group, the pair joins it
-    instead of creating a second group about the same event."""
+    """v7: returns {'group_id', 'joined', 'merged', 'members'} or None on failure.
+    No waiting group on either side → a new group. One → the pair joins it. Two or more (the pair links two
+    piles of copies of the same event) → they are merged into the oldest one: rows move over, the others get
+    status 'merged' and keep no rows. A row the admin took out («➖ Убрать лишнее», reason 'excluded') stays
+    taken out — moving or re-pairing never brings it back. members = ids in the group, excluded ones left out."""
     try:
         conn = get_conn()
     except Exception as e:
         logging.error(f"create_or_join_group connect error: {e}")
-        return False, None
+        return None
     c = conn.cursor()
     try:
         c.execute("""
-            SELECT g.id FROM dup_groups g
+            SELECT DISTINCT g.id FROM dup_groups g
             JOIN dup_group_items i ON i.group_id = g.id
-            WHERE g.status = 'wait' AND i.event_id IN (%s, %s)
-            ORDER BY g.id LIMIT 1
+            WHERE g.status = 'wait' AND i.event_id IN (%s, %s) AND COALESCE(i.reason, '') <> 'excluded'
+            ORDER BY g.id
         """, (new_id, other_id))
-        row = c.fetchone()
-        joined = bool(row)
-        if joined:
-            group_id = row['id']
+        ids = [r['id'] for r in c.fetchall()]
+        merged = 0
+        if ids:
+            group_id = ids[0]
+            for gid in ids[1:]:
+                c.execute("""
+                    INSERT INTO dup_group_items (group_id, event_id, score, by_ai, reason, hidden)
+                    SELECT %s, event_id, score, by_ai, reason, hidden FROM dup_group_items WHERE group_id = %s
+                    ON CONFLICT (group_id, event_id) DO UPDATE
+                        SET reason = CASE WHEN COALESCE(dup_group_items.reason, '') = 'excluded'
+                                            OR COALESCE(excluded.reason, '') = 'excluded'
+                                          THEN 'excluded' ELSE dup_group_items.reason END
+                """, (group_id, gid))
+                c.execute('DELETE FROM dup_group_items WHERE group_id = %s', (gid,))
+                c.execute("""
+                    UPDATE dup_groups SET status = 'merged', keep_id = NULL, decided_at = now() WHERE id = %s
+                """, (gid,))
+                merged += 1
         else:
             c.execute('INSERT INTO dup_groups (day, city) VALUES (%s, %s) RETURNING id', (day, city))
             group_id = c.fetchone()['id']
@@ -629,17 +658,54 @@ def create_or_join_group(day: str, city, new_id: int, other_id: int, score: floa
             INSERT INTO dup_group_items (group_id, event_id, score, by_ai, reason)
             VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (group_id, event_id) DO UPDATE
-                SET score = excluded.score, by_ai = excluded.by_ai, reason = excluded.reason
+                SET score = excluded.score, by_ai = excluded.by_ai,
+                    reason = CASE WHEN COALESCE(dup_group_items.reason, '') = 'excluded'
+                                  THEN 'excluded' ELSE excluded.reason END
         """, (group_id, new_id, round(float(score), 3), by_ai, (reason or '')[:200]))
         _recompute_keep(c, group_id)
+        c.execute("""
+            SELECT event_id FROM dup_group_items WHERE group_id = %s AND COALESCE(reason, '') <> 'excluded'
+        """, (group_id,))
+        members = {r['event_id'] for r in c.fetchall()}
         conn.commit()
-        logging.info(f"Дубли: {'дописано в группу' if joined else 'новая группа'} {group_id} "
+        logging.info(f"Дубли: {'дописано в группу' if ids else 'новая группа'} {group_id}"
+                     f"{f', слито групп {merged}' if merged else ''} "
                      f"({new_id} ↔ {other_id}, похожесть {score:.2f})")
-        return joined, group_id
+        return {'group_id': group_id, 'joined': bool(ids), 'merged': merged, 'members': members}
     except Exception as e:
         conn.rollback()
         logging.error(f"create_or_join_group error ({new_id} ↔ {other_id}): {e}")
-        return False, None
+        return None
+    finally:
+        conn.close()
+
+
+def record_not_dup(day: str, city, a_id: int, b_id: int, why: str) -> bool:
+    """v7: the judge said «разные» — remember it as a closed pair (dup_groups.status 'ai_no', two rows), so the
+    same pair is never sent to the judge again: find_dup_candidates skips pairs that share any group. Not shown
+    in the add-bot (it lists only 'wait')."""
+    try:
+        conn = get_conn()
+    except Exception as e:
+        logging.error(f"record_not_dup connect error: {e}")
+        return False
+    c = conn.cursor()
+    try:
+        c.execute("""
+            INSERT INTO dup_groups (day, city, status, decided_at) VALUES (%s, %s, 'ai_no', now()) RETURNING id
+        """, (day, city))
+        gid = c.fetchone()['id']
+        c.execute("""
+            INSERT INTO dup_group_items (group_id, event_id, by_ai, reason)
+            VALUES (%s, %s, true, %s), (%s, %s, true, %s)
+            ON CONFLICT (group_id, event_id) DO NOTHING
+        """, (gid, a_id, (why or '')[:200], gid, b_id, (why or '')[:200]))
+        conn.commit()
+        return True
+    except Exception as e:
+        conn.rollback()
+        logging.error(f"record_not_dup error ({a_id} ↔ {b_id}): {e}")
+        return False
     finally:
         conn.close()
 

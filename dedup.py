@@ -1,4 +1,10 @@
-# dedup.py — v2
+# dedup.py — v3
+# v3 — task 56: every event is compared with all its nearest neighbours (up to 5), not only until the first match,
+#      and a pair that links two waiting groups merges them (database.py v7) — piles 1+2 and 3+4 of one event no
+#      longer survive as two groups that keep two copies visible after approval. A neighbour already in the
+#      group is skipped without asking the judge. The judge's «разные» is remembered (status 'ai_no'), so no pair
+#      is ever judged twice — by the parser and by run_old() alike. Report: «слито групп N». Needs database.py v7.
+#      22.10.2026
 # v2 — task 56, old events + fixes (22.10.2026):
 #      1) run_old(): the daily check of events that were in the base before the duplicate check existed (and of
 #         add-bot events, which nobody checked). Vectors for all of them, then nearest dates first, each compared
@@ -12,9 +18,6 @@
 #      5) Past waiting groups are closed (status 'expired') by run_old(); the reports carry a link that opens the
 #         add-bot screen (?start=dup, add v83); the report names which judge models answered.
 #      Needs database.py v6.
-# v1 — task 56: semantic duplicates for the parser. Embeddings via Cloudflare Workers AI, candidates inside the
-#      same day + city, AI judge for the grey band, groups for manual review in the add-bot. Nothing is hidden
-#      while bot_settings.dup_auto is off. Created 21.10.2026
 #
 # GitHub secrets:   CF_ACCOUNT_ID, CF_AI_TOKEN
 # GitHub variables: DUP_ON (1/0, default 1), DUP_MODEL (default @cf/baai/bge-m3), DUP_FILL_MAX (default 400),
@@ -100,6 +103,7 @@ STATS = {
     'giveaway': 0,     # pairs skipped: giveaway vs announcement
     'groups_new': 0,
     'groups_join': 0,
+    'groups_merged': 0,  # v3: two piles of the same event joined into one group
     'hidden': 0,       # hidden right away (only while dup_auto is on)
     'errors': 0,
     # run_old() only
@@ -261,13 +265,22 @@ async def _fill_missing_vectors(day: str, city: str):
 
 
 async def _check_pairs(event_id: int, ev: dict, day: str, city, budget: int, only_checked: bool) -> bool:
-    """Looks for this event's duplicate among its neighbours and puts the pair into a group.
-    Returns False when a grey pair had to be skipped (judge budget spent, or no judge answered) —
+    """Looks for this event's duplicates among its nearest neighbours and puts them into one group.
+    v3: goes through ALL neighbours (up to CAND_LIMIT), not just until the first match — stopping early let copies
+    of one event split into separate piles that were approved separately and both stayed visible. A neighbour
+    already in my group (after a join or a merge) is skipped without asking the judge.
+    Returns False when a grey pair had to be skipped (judge budget spent, no judge answered, group write failed) —
     the event then stays unchecked and run_old() comes back to it the next day."""
     st = settings()
     complete = True
+    linked = set()   # ids already in my group
+    allowed = None   # after a link: neighbours still allowed (the time rule now sees my group)
     candidates = db.find_dup_candidates(event_id, CAND_LIMIT, st['lo'], only_checked)
     for cand in candidates:
+        if cand['id'] in linked:
+            continue
+        if allowed is not None and cand['id'] not in allowed:
+            continue
         if is_giveaway(ev) != is_giveaway(cand):
             STATS['giveaway'] += 1
             continue
@@ -289,6 +302,7 @@ async def _check_pairs(event_id: int, ev: dict, day: str, city, budget: int, onl
                 complete = False
                 continue
             if not same:
+                db.record_not_dup(day, city, event_id, cand['id'], why)   # v3: never ask about this pair again
                 continue
             STATS['judged_yes'] += 1
             by_ai = True
@@ -296,15 +310,19 @@ async def _check_pairs(event_id: int, ev: dict, day: str, city, budget: int, onl
         else:
             continue
 
-        joined, group_id = db.create_or_join_group(day, city, event_id, cand['id'], score, by_ai, reason)
-        if not group_id:
+        res = db.create_or_join_group(day, city, event_id, cand['id'], score, by_ai, reason)
+        if not res:
             complete = False
             continue
-        STATS['groups_join' if joined else 'groups_new'] += 1
+        if not linked:   # the first link of this event: a new group or a join; later links only add to it
+            STATS['groups_join' if res['joined'] else 'groups_new'] += 1
+        STATS['groups_merged'] += res['merged']
+        linked |= res['members']
         if st['auto']:
-            STATS['hidden'] += db.hide_losers(group_id)
-        # one duplicate per event is enough: the rest of the group is found through the group itself
-        return True
+            STATS['hidden'] += db.hide_losers(res['group_id'])
+        # My group may now hold a start time (19:00) that a later neighbour's group contradicts (21:00) —
+        # ask the database again which of the remaining neighbours are still allowed.
+        allowed = {c['id'] for c in db.find_dup_candidates(event_id, CAND_LIMIT, st['lo'], only_checked)}
     return complete
 
 
@@ -348,6 +366,7 @@ def report_line() -> str:
             f"спорных {STATS['pairs_grey']} (разобрано судьёй {STATS['judged']}, "
             f"из них дубли {STATS['judged_yes']}, осталось на завтра {STATS['grey_left']}), "
             f"групп новых {STATS['groups_new']}, дописано в старые {STATS['groups_join']}"
+            + (f", слито групп {STATS['groups_merged']}" if STATS['groups_merged'] else '')
             + (f", розыгрыш≠анонс {STATS['giveaway']}" if STATS['giveaway'] else '')
             + (f", скрыто автоматом {STATS['hidden']}" if STATS['hidden'] else '')
             + _judge_models_text())
@@ -361,7 +380,7 @@ async def finish_run(notify):
     logging.info(line)
     if PROBLEMS:
         await notify("⚠️ Дубли: " + "\n".join(PROBLEMS) + f"\n\n{line}\nМероприятия сохранялись как обычно.")
-    elif STATS['groups_new'] or STATS['groups_join']:
+    elif STATS['groups_new'] or STATS['groups_join'] or STATS['groups_merged']:
         await notify(line + f"\n\nПосмотреть и подтвердить: {DUP_SCREEN_LINK}")
 
 
@@ -393,6 +412,7 @@ def old_report_line(left) -> str:
             f"спорных {STATS['pairs_grey']} (разобрано судьёй {STATS['judged']}, "
             f"из них дубли {STATS['judged_yes']}, на завтра {STATS['grey_left']}), "
             f"групп новых {STATS['groups_new']}, дописано в старые {STATS['groups_join']}"
+            + (f", слито групп {STATS['groups_merged']}" if STATS['groups_merged'] else '')
             + (f", розыгрыш≠анонс {STATS['giveaway']}" if STATS['giveaway'] else '')
             + (f", скрыто автоматом {STATS['hidden']}" if STATS['hidden'] else '')
             + (f", закрыто прошедших групп {STATS['expired']}" if STATS['expired'] else '')
@@ -442,7 +462,7 @@ async def run_old(notify):
         finished_now = left == 0 and not done_before
         if finished_now:
             db.set_setting('dup_old_done', time.strftime('%Y-%m-%d'))
-        found = STATS['groups_new'] or STATS['groups_join']
+        found = STATS['groups_new'] or STATS['groups_join'] or STATS['groups_merged']
         text = ''
         if PROBLEMS:
             text = "⚠️ Дубли среди старых: " + "\n".join(PROBLEMS) + f"\n\n{line}"
