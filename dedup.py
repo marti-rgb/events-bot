@@ -1,27 +1,11 @@
-# dedup.py — v4
+# dedup.py — v5
+# v5 — task 56: in the report of the OLD-events check the line «векторов N» showed the parser pass counter and so
+#      was always 0 — run_old() counts the vectors it builds in another one. Numbers only, nothing else changed.
+#      22.10.2026
 # v4 — task 56: the judge's answer ceiling is 200 → 1500 tokens (variable DUP_JUDGE_TOKENS). gpt-oss-120b reasons
 #      before answering and the reasoning ate the 200, so Groq returned empty or truncated JSON («Expecting value»,
 #      «Unterminated string») and every pair went to the slower reserve — about 90 s instead of 25 s per pair, and
 #      the free Groq day was spent on answers nobody could read. Reasoning is left on (decision 21.10). 22.10.2026
-# v3 — task 56: every event is compared with all its nearest neighbours (up to 5), not only until the first match,
-#      and a pair that links two waiting groups merges them (database.py v7) — piles 1+2 and 3+4 of one event no
-#      longer survive as two groups that keep two copies visible after approval. A neighbour already in the
-#      group is skipped without asking the judge. The judge's «разные» is remembered (status 'ai_no'), so no pair
-#      is ever judged twice — by the parser and by run_old() alike. Report: «слито групп N». Needs database.py v7.
-#      22.10.2026
-# v2 — task 56, old events + fixes (22.10.2026):
-#      1) run_old(): the daily check of events that were in the base before the duplicate check existed (and of
-#         add-bot events, which nobody checked). Vectors for all of them, then nearest dates first, each compared
-#         only with neighbours already checked — every pair is looked at once. Own judge budget dup_old_ai_budget.
-#         Started by dedup_old.py (GitHub workflow dedup_old.yml), not by the parser.
-#      2) A pair whose grey part could not be judged (budget spent) no longer marks the event as checked —
-#         «осталось на завтра» is now true: run_old() picks such events up the next day.
-#      3) Giveaway ≠ announcement: if exactly one of the two titles is a giveaway («Розыгрыш…», «Дарим…»), it is
-#         not a duplicate, the judge is not asked — works above dup_hi too. The judge prompt got the same rule.
-#      4) Pause between judge questions (DUP_JUDGE_GAP, 8 s): Groq free gpt-oss-120b allows 8K tokens a minute.
-#      5) Past waiting groups are closed (status 'expired') by run_old(); the reports carry a link that opens the
-#         add-bot screen (?start=dup, add v83); the report names which judge models answered.
-#      Needs database.py v6.
 #
 # GitHub secrets:   CF_ACCOUNT_ID, CF_AI_TOKEN
 # GitHub variables: DUP_ON (1/0, default 1), DUP_MODEL (default @cf/baai/bge-m3), DUP_FILL_MAX (default 400),
@@ -417,7 +401,7 @@ async def _old_vectors(rows: list) -> set:
 def old_report_line(left) -> str:
     left_txt = 'не удалось посчитать' if left is None else str(left)
     return (f"🧩 Дубли среди старых: проверено {STATS['checked']}, осталось {left_txt}; "
-            f"векторов {STATS['vectors']}, явных пар {STATS['pairs_hi']}, "
+            f"векторов {STATS['filled']}, явных пар {STATS['pairs_hi']}, "
             f"спорных {STATS['pairs_grey']} (разобрано судьёй {STATS['judged']}, "
             f"из них дубли {STATS['judged_yes']}, на завтра {STATS['grey_left']}), "
             f"групп новых {STATS['groups_new']}, дописано в старые {STATS['groups_join']}"
