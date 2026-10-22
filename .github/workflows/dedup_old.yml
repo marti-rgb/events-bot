@@ -1,11 +1,18 @@
 name: Dedup Old Events
-# ВЕРСИЯ v1 — 22.10.2026
-# v1 — task 56: daily duplicate check of old events (dedup_old.py → dedup.run_old). Runs at 10:00 UTC = 13:00 МСК,
-#      when the parser (01:00 UTC start, 350 min limit) has surely finished. «Run workflow» starts it by hand.
-#      Same secrets as Parse Events, nothing new. DUP_ON=0 turns it off together with the parser's check.
+# ВЕРСИЯ v2 — 22.10.2026
+# v2 — task 56: started by the END of «Parse Events», not by the clock. The old 10:00 UTC was chosen so the parser
+#      would surely be over — but its own two runs share one concurrency group, so the 02:00 run only starts when
+#      the 01:00 one is finished (an hour or two later), and GitHub adds its own queue delay on top: on 22.10 the
+#      scheduled parser runs began at 05:33 and 07:05 UTC. Any fixed hour can therefore land inside a parser run,
+#      and the check would then read a base being written to. workflow_run has no such problem: it fires whenever
+#      the parser actually finished, early or late. It fires after a failed run too — checking old events still
+#      makes sense. «Run workflow» starts it by hand as before. Same secrets, nothing new.
+# v1 — task 56: daily duplicate check of old events (dedup_old.py → dedup.run_old). Ran at 10:00 UTC = 13:00 МСК.
+#      DUP_ON=0 turns it off together with the parser's check.
 on:
-  schedule:
-    - cron: '0 10 * * *'
+  workflow_run:
+    workflows: ["Parse Events"]
+    types: [completed]
   workflow_dispatch:
 jobs:
   dedup-old:
