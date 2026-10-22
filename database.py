@@ -1,4 +1,8 @@
-# database.py — v9 (имя файла не меняется: его импортирует parser.py)
+# database.py — v10 (имя файла не меняется: его импортирует parser.py)
+# v10 — task 56, «кого оставить»: the price counts as known when the text field is filled OR the «бесплатно» flag
+#       (events.is_free) is on. They are separate columns; counting only the text made all seven «Октоберфест»
+#       copies look equally empty and the survivor was the single card that said nothing about the price — it also
+#       drops out of the «Бесплатно» filter in search. Same change in the add-bot v86. No migration. Updated 22.10.2026
 # v9 — task 56, «кого оставить»: a start time is now the second step, right after «от организатора», and the four
 #      remaining fields (price, address, photo, registration link) are COUNTED instead of being a strict ladder —
 #      a card with only an address no longer beats a card with a time, a price and a photo. Reason behind the time
@@ -6,10 +10,6 @@
 #      card buried the whole event («Октоберфест» 23.10, 8 copies). The reason shown is now the step that really
 #      decided, found by narrowing the field (pick_keep) — «от организатора», «указано время», «заполнена полнее»,
 #      «описание подробнее», «добавлено позже». Same list in the add-bot v85. No migration. Updated 22.10.2026
-# v8 — task 56: the «кого оставить» reason knows the description rule. A card that won because its description is
-#      the longest one in the group used to be labelled «добавлено позже» (the last branch), which contradicted the
-#      visible ids — the choice was right, the explanation wasn't. New reason «описание подробнее»; the rule order
-#      itself is unchanged. The same branch was added to the add-bot (v84). No migration. Updated 22.10.2026
 #
 # История версий (старше двух последних) — в versions_history.md
 import os
@@ -559,8 +559,11 @@ def find_dup_candidates(event_id: int, limit: int, min_score: float, only_checke
 # The reason shown is the step that actually decided: the first one where a single card was left standing.
 # The same list, in the same order, lives in the add-bot (dupPick) — change both together.
 def _keep_fullness(r) -> int:
+    # v10: the price counts as known when the text field is filled OR the «бесплатно» flag is on — they are two
+    # different columns and the card shows either of them as 💰. Counting only the text field made seven copies of
+    # «Октоберфест» look equally empty, and the one card that said nothing about the price won on description.
     return sum(1 for v in (
-        (r.get('price') or '').strip(),
+        (r.get('price') or '').strip() or bool(r.get('is_free')),
         (r.get('address') or '').strip(),
         (r.get('photo_id') or '').strip() or r.get('media_message_id'),
         (r.get('reg_link') or '').strip(),
@@ -597,7 +600,7 @@ def pick_keep(rows: list):
 def _recompute_keep(c, group_id: int):
     """Picks the survivor of the group and writes a short reason into dup_groups.keep_id / items."""
     c.execute("""
-        SELECT id, added_by_user, time, price, address, photo_id, media_message_id, reg_link,
+        SELECT id, added_by_user, time, price, is_free, address, photo_id, media_message_id, reg_link,
                description, created_at
         FROM events
         WHERE id IN (SELECT event_id FROM dup_group_items
