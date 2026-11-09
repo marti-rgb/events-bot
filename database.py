@@ -1,17 +1,12 @@
-# database.py — v10 (имя файла не меняется: его импортирует parser.py)
+# database.py — v11
+# v11 — Supplemental candidates, persistent manual review and resumable backfill.
+# Requires migration_20261109_dup_extra_review.sql. Updated 09.11.2026.
 # v10 — task 56, «кого оставить»: the price counts as known when the text field is filled OR the «бесплатно» flag
 #       (events.is_free) is on. They are separate columns; counting only the text made all seven «Октоберфест»
 #       copies look equally empty and the survivor was the single card that said nothing about the price — it also
 #       drops out of the «Бесплатно» filter in search. Same change in the add-bot v86. No migration. Updated 22.10.2026
-# v9 — task 56, «кого оставить»: a start time is now the second step, right after «от организатора», and the four
-#      remaining fields (price, address, photo, registration link) are COUNTED instead of being a strict ladder —
-#      a card with only an address no longer beats a card with a time, a price and a photo. Reason behind the time
-#      step: search orders a day by start time and puts cards without one at the end of the day, so keeping such a
-#      card buried the whole event («Октоберфест» 23.10, 8 copies). The reason shown is now the step that really
-#      decided, found by narrowing the field (pick_keep) — «от организатора», «указано время», «заполнена полнее»,
-#      «описание подробнее», «добавлено позже». Same list in the add-bot v85. No migration. Updated 22.10.2026
 #
-# История версий (старше двух последних) — в versions_history.md
+# Earlier versions: archive/versions_history.md.
 import os
 import json
 import logging
@@ -468,7 +463,22 @@ def find_events_without_vector(day: str, city, limit: int) -> list:
         conn.close()
 
 
-def find_dup_candidates(event_id: int, limit: int, min_score: float, only_checked: bool = False) -> list:
+def _dup_text_key(column: str) -> str:
+    # Columns below are fixed SQL expressions, never user input.
+    return f"trim(regexp_replace(replace(lower(COALESCE({column}, '')), 'ё', 'е'), '[^a-zа-я0-9]+', ' ', 'g'))"
+
+
+def _dup_title_terms(column: str) -> str:
+    # Short stems tolerate Russian endings; generic advertising words are not event names.
+    stops = "'беспл','посещ','вход','визит','мероп','событ','фести','выста','конце','спект','прогр','рамка','акция','акции','москв','моско','город','сегод','пригл','билет'"
+    return f"""ARRAY(SELECT DISTINCT left(word, 5)
+        FROM unnest(string_to_array({_dup_text_key(column)}, ' ')) AS t(word)
+        WHERE length(word) >= 4 AND left(word, 5) NOT IN ({stops})
+        ORDER BY 1)"""
+
+
+def find_dup_candidates(event_id: int, limit: int, min_score: float,
+                        only_checked: bool = False, supplemental: bool = False):
     """Nearest events by meaning inside the same day and city.
     Skipped: other time (unless one of the two has none), rows of the same post, pairs that already share a
     group (waiting, decided, «не дубли» or taken out by the admin — v6: any group, so no pair is judged twice),
@@ -479,20 +489,24 @@ def find_dup_candidates(event_id: int, limit: int, min_score: float, only_checke
         conn = get_conn()
     except Exception as e:
         logging.error(f"find_dup_candidates connect error: {e}")
-        return []
+        return None
     c = conn.cursor()
     try:
-        c.execute("""
+        c.execute(f"""
             WITH me AS (
                 SELECT e.id,
                        e.date,
                        COALESCE(NULLIF(e.city_parsed->>0, ''), NULLIF(e.city, '')) AS city,
                        NULLIF(e.time, '') AS tm,
                        split_part(COALESCE(e.source_url, ''), '#', 1) AS post_url,
-                       v.vec AS vec
+                       v.vec AS vec, v.model AS vector_model,
+                       {_dup_text_key('e.location')} AS place_key,
+                       {_dup_text_key('e.title')} AS title_key,
+                       {_dup_title_terms('e.title')} AS title_terms
                 FROM events e
                 JOIN event_vectors v ON v.event_id = e.id
                 WHERE e.id = %s
+                  AND (COALESCE(e.is_ignored, false) = false OR e.ignored_reason = 'queue')
             ),
             -- v7: every start time on my side — mine and those of my waiting groups (excluded rows don't count)
             my_times AS (
@@ -504,13 +518,29 @@ def find_dup_candidates(event_id: int, limit: int, min_score: float, only_checke
                 JOIN dup_groups mg ON mg.id = mi.group_id AND mg.status = 'wait'
                 JOIN dup_group_items mj ON mj.group_id = mi.group_id AND COALESCE(mj.reason, '') <> 'excluded'
                 JOIN events ek ON ek.id = mj.event_id
-            )
+            ), my_members AS (
+                SELECT me.id FROM me
+                UNION
+                SELECT mj.event_id FROM me
+                JOIN dup_group_items mi ON mi.event_id = me.id AND COALESCE(mi.reason, '') <> 'excluded'
+                JOIN dup_groups mg ON mg.id = mi.group_id AND mg.status = 'wait'
+                JOIN dup_group_items mj ON mj.group_id = mi.group_id AND COALESCE(mj.reason, '') <> 'excluded'
+            ), eligible AS (
             SELECT e.id, e.title, e.date, e.time, e.location, e.address, e.price, e.description,
-                   (1 - (v.vec <=> me.vec)) AS score
+                   (1 - (v.vec <=> me.vec)) AS score,
+                   (length(me.place_key) >= 6
+                    AND me.place_key <> {_dup_text_key('me.city')}
+                    AND me.place_key NOT IN ('онлайн', 'online', 'весь город')
+                    AND {_dup_text_key('e.location')} = me.place_key) AS same_place,
+                   me.city AS candidate_city,
+                   me.title_key AS my_title_key, me.title_terms AS my_title_terms,
+                   {_dup_text_key('e.title')} AS title_key,
+                   {_dup_title_terms('e.title')} AS title_terms
             FROM events e
             JOIN event_vectors v ON v.event_id = e.id
             CROSS JOIN me
             WHERE e.id <> me.id
+              AND v.model = me.vector_model
               AND e.date = me.date
               AND COALESCE(NULLIF(e.city_parsed->>0, ''), NULLIF(e.city, '')) IS NOT DISTINCT FROM me.city
               AND (COALESCE(e.is_ignored, false) = false OR e.ignored_reason = 'queue')
@@ -540,14 +570,44 @@ def find_dup_candidates(event_id: int, limit: int, min_score: float, only_checke
                     WHERE mt.t IS NOT NULL AND ct.t IS NOT NULL AND mt.t <> ct.t
               )
               AND (%s = false OR e.dup_checked_at IS NOT NULL)
-              AND (1 - (v.vec <=> me.vec)) >= %s
-            ORDER BY v.vec <=> me.vec
+              -- Never reconnect a rejected/AI-negative pair through a third card or a group merge.
+              AND NOT EXISTS (
+                  SELECT 1 FROM my_members mm
+                  JOIN dup_group_items no_a ON no_a.event_id = mm.id
+                  JOIN dup_groups no_g ON no_g.id = no_a.group_id AND no_g.status IN ('rejected', 'ai_no')
+                  JOIN dup_group_items no_b ON no_b.group_id = no_g.id
+                  WHERE no_b.event_id IN (
+                      SELECT e.id
+                      UNION
+                      SELECT gj.event_id FROM dup_group_items gi
+                      JOIN dup_groups gg ON gg.id = gi.group_id AND gg.status = 'wait'
+                      JOIN dup_group_items gj ON gj.group_id = gi.group_id AND COALESCE(gj.reason, '') <> 'excluded'
+                      WHERE gi.event_id = e.id AND COALESCE(gi.reason, '') <> 'excluded'
+                  )
+              )
+            ), named AS (
+                SELECT eligible.*, ARRAY(
+                    SELECT unnest(title_terms) INTERSECT SELECT unnest(my_title_terms)
+                ) AS shared_terms FROM eligible
+            )
+            SELECT id, title, date, time, location, address, price, description, score, same_place
+            FROM named
+            WHERE CASE WHEN %s THEN
+                score < %s AND NULLIF(candidate_city, '') IS NOT NULL AND (
+                    same_place OR
+                    (cardinality(title_terms) > 0 AND title_key = my_title_key) OR
+                    (cardinality(shared_terms) >= 2
+                     AND 2 * cardinality(shared_terms) >= least(cardinality(title_terms), cardinality(my_title_terms)))
+                )
+                ELSE score >= %s END
+            ORDER BY CASE WHEN %s THEN same_place ELSE false END DESC, score DESC, id
             LIMIT %s
-        """, (event_id, bool(only_checked), min_score, limit))
+        """, (event_id, bool(only_checked), bool(supplemental), min_score,
+              min_score, bool(supplemental), limit))
         return [dict(row) for row in c.fetchall()]
     except Exception as e:
         logging.error(f"find_dup_candidates error (event {event_id}): {e}")
-        return []
+        return None
     finally:
         conn.close()
 
@@ -622,7 +682,8 @@ def _recompute_keep(c, group_id: int):
     return row['id']
 
 
-def create_or_join_group(day: str, city, new_id: int, other_id: int, score: float, by_ai: bool, reason: str):
+def create_or_join_group(day: str, city, new_id: int, other_id: int, score: float,
+                         by_ai: bool, reason: str, requires_review: bool = False):
     """v7: returns {'group_id', 'joined', 'merged', 'members'} or None on failure.
     No waiting group on either side → a new group. One → the pair joins it. Two or more (the pair links two
     piles of copies of the same event) → they are merged into the oldest one: rows move over, the others get
@@ -636,12 +697,16 @@ def create_or_join_group(day: str, city, new_id: int, other_id: int, score: floa
     c = conn.cursor()
     try:
         c.execute("""
-            SELECT DISTINCT g.id FROM dup_groups g
-            JOIN dup_group_items i ON i.group_id = g.id
-            WHERE g.status = 'wait' AND i.event_id IN (%s, %s) AND COALESCE(i.reason, '') <> 'excluded'
-            ORDER BY g.id
+            SELECT g.id, g.requires_review FROM dup_groups g
+            WHERE g.status = 'wait' AND EXISTS (
+                SELECT 1 FROM dup_group_items i WHERE i.group_id = g.id
+                AND i.event_id IN (%s, %s) AND COALESCE(i.reason, '') <> 'excluded'
+            )
+            ORDER BY g.id FOR UPDATE
         """, (new_id, other_id))
-        ids = [r['id'] for r in c.fetchall()]
+        waiting = c.fetchall()
+        ids = [r['id'] for r in waiting]
+        requires_review = bool(requires_review or any(r['requires_review'] for r in waiting))
         merged = 0
         if ids:
             group_id = ids[0]
@@ -662,6 +727,9 @@ def create_or_join_group(day: str, city, new_id: int, other_id: int, score: floa
         else:
             c.execute('INSERT INTO dup_groups (day, city) VALUES (%s, %s) RETURNING id', (day, city))
             group_id = c.fetchone()['id']
+        # The hold survives joins/merges, including a later high-score automatic candidate.
+        if requires_review:
+            c.execute('UPDATE dup_groups SET requires_review = true WHERE id = %s', (group_id,))
         c.execute("""
             INSERT INTO dup_group_items (group_id, event_id, score, by_ai, reason)
             VALUES (%s, %s, %s, %s, %s)
@@ -684,7 +752,8 @@ def create_or_join_group(day: str, city, new_id: int, other_id: int, score: floa
         logging.info(f"Дубли: {'дописано в группу' if ids else 'новая группа'} {group_id}"
                      f"{f', слито групп {merged}' if merged else ''} "
                      f"({new_id} ↔ {other_id}, похожесть {score:.2f})")
-        return {'group_id': group_id, 'joined': bool(ids), 'merged': merged, 'members': members}
+        return {'group_id': group_id, 'joined': bool(ids), 'merged': merged,
+                'members': members, 'requires_review': requires_review}
     except Exception as e:
         conn.rollback()
         logging.error(f"create_or_join_group error ({new_id} ↔ {other_id}): {e}")
@@ -733,7 +802,9 @@ def hide_losers(group_id: int) -> int:
         return 0
     c = conn.cursor()
     try:
-        c.execute('SELECT keep_id FROM dup_groups WHERE id = %s', (group_id,))
+        c.execute("""SELECT keep_id FROM dup_groups
+                     WHERE id = %s AND status = 'wait' AND requires_review = false
+                     FOR UPDATE""", (group_id,))
         row = c.fetchone()
         keep_id = row['keep_id'] if row else None
         if not keep_id:
@@ -770,14 +841,16 @@ def mark_dup_checked(event_id: int):
         conn = get_conn()
     except Exception as e:
         logging.error(f"mark_dup_checked connect error: {e}")
-        return
+        return False
     c = conn.cursor()
     try:
         c.execute('UPDATE events SET dup_checked_at = now() WHERE id = %s', (event_id,))
         conn.commit()
+        return True
     except Exception as e:
         conn.rollback()
         logging.error(f"mark_dup_checked error: {e}")
+        return False
     finally:
         conn.close()
 
@@ -835,6 +908,65 @@ def count_old_unchecked():
     except Exception as e:
         logging.error(f"count_old_unchecked error: {e}")
         return None
+    finally:
+        conn.close()
+
+
+_EXTRA_WHERE = f"""
+    e.dup_extra_checked_at IS NULL
+    AND COALESCE(e.date, '') <> '' AND e.date >= {_TODAY_MSK}
+    AND (COALESCE(e.is_ignored, false) = false OR e.ignored_reason = 'queue')
+"""
+
+
+def list_extra_unchecked(limit: int, event_ids=None) -> list:
+    """Independent progress marker: no reset of normal checks or prior pair decisions.
+    New-parser runs pass only their own IDs; run_old drains the historical backlog as well.
+    The shared predicate leaves incomplete normal checks for the normal queue first."""
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        restrict = 'AND e.id = ANY(%s)' if event_ids is not None else ''
+        params = (list(event_ids), limit) if event_ids is not None else (limit,)
+        c.execute(f"""
+            SELECT e.id, e.title, e.date, e.time, e.location, e.address, e.price, e.description,
+                   COALESCE(NULLIF(e.city_parsed->>0, ''), NULLIF(e.city, '')) AS city,
+                   (v.event_id IS NOT NULL) AS has_vec
+            FROM events e LEFT JOIN event_vectors v ON v.event_id = e.id
+            WHERE {_EXTRA_WHERE} AND e.dup_checked_at IS NOT NULL {restrict}
+            ORDER BY e.date, e.id LIMIT %s
+        """, params)
+        return [dict(row) for row in c.fetchall()]
+    finally:
+        conn.close()
+
+
+def count_extra_unchecked() -> int:
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(f'SELECT count(*) AS n FROM events e WHERE {_EXTRA_WHERE}')
+        return int(c.fetchone()['n'])
+    finally:
+        conn.close()
+
+
+def mark_extra_checked(event_id: int):
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute('UPDATE events SET dup_extra_checked_at = now() WHERE id = %s', (event_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def count_waiting_dup_groups() -> int:
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(f"SELECT count(*) AS n FROM dup_groups WHERE status = 'wait' AND day >= {_TODAY_MSK}")
+        return int(c.fetchone()['n'])
     finally:
         conn.close()
 
