@@ -1,8 +1,6 @@
-# parser.py — v51
+# parser.py — v52
+# v52 (2026-11-20): Preserve post links for registration analysis and save registration details.
 # v51 (2026-11-20): Resume incomplete passes; record qualified posts before deduplication; mark after persistence.
-# v50 — task 56: after every saved event the semantic duplicate check runs (dedup.py), wrapped so that any of its
-# failures only get logged and reported once per run — parsing itself never stops. The run ends with one summary
-# line about duplicates. Needs dedup.py v1, database.py v5 and migration_20261021_dup.sql. Updated 21.10.2026
 # История версий (старше двух последних) — в versions_history.md
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
@@ -12,6 +10,7 @@
 import asyncio
 import logging
 import time
+from urllib.parse import urlsplit
 import httpx
 from bs4 import BeautifulSoup
 from analyzer import analyze_post, screen_post
@@ -124,13 +123,32 @@ async def _fetch_one_page(client: httpx.AsyncClient, channel: str, url: str) -> 
                 'id': msg_id,
                 'text': text,
                 'url': f'https://t.me/{channel}/{msg_id}',
-                'post_date': post_date
+                'post_date': post_date,
+                'links': post_links(text_div),
             })
         
         return posts
     except Exception as e:
         logging.error(f"❌ Ошибка получения @{channel}: {e}")
         raise
+
+
+def post_links(text_div) -> dict[str, str]:
+    links = {}
+    for a in text_div.find_all('a', href=True):
+        url = (a['href'] or '').strip()
+        if not url or len(url) > 500 or any(char.isspace() or ord(char) < 32 or char in '"<>\\' for char in url):
+            continue
+        try:
+            parsed = urlsplit(url)
+            if parsed.scheme not in ('http', 'https') or not parsed.hostname or parsed.username is not None:
+                continue
+        except ValueError:
+            continue
+        links.setdefault(url, a.get_text(separator=' ', strip=True)[:100])
+        if len(links) >= 12:
+            break
+    return links
 
 async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_keywords: list = [], categories: dict = {}, stop_tags: list = []):
     channel = channel_config['channel']
@@ -205,7 +223,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 continue
 
         processed += 1
-        result = await analyze_post(post['text'], post.get('post_date', ''), categories)
+        result = await analyze_post(post['text'], post.get('post_date', ''), categories, post.get('links'))
         if not result:
             error += 1
         log_parse(
@@ -238,6 +256,8 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 'city_parsed': result.get('city_parsed'),
                 'address': result.get('address'),
                 'price': result.get('price'),
+                'has_registration': result.get('has_registration') is True,
+                'reg_link': result.get('reg_link'),
                 'source_url': post['url'],
                 'channel': channel,
                 'city': channel_config.get('city', 'Москва'),
