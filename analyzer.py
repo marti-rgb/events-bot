@@ -1,9 +1,6 @@
-# analyzer.py — v46
+# analyzer.py — v47
+# v47 (2026-11-20): Identify registration separately and recognize explicit ticket sales without a price.
 # v46 (2026-11-20): Validate model payload types and event dates.
-# v45 — sections (L1) are always brought to the справочник: the AI's answer is fitted by spelling (case, word order,
-# part of the name: «искусство и культура» → «Культура и искусство», «Бизнес» → «Бизнес и нетворкинг»); if nothing fits
-# and the post is an event — a short second request asks the AI to pick 1–2 sections from the list; if no model answers,
-# the post is returned as not processed (retried next run) instead of being thrown away. Every fit is logged. Updated 14.10.2026
 # История версий (старше двух последних) — в versions_history.md
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
@@ -13,7 +10,7 @@ def validate_analysis(data):
     from datetime import date
     if not isinstance(data, dict):
         raise ValueError('Model result must be an object')
-    for key in ('is_event', 'is_free', 'for_children'):
+    for key in ('is_event', 'is_free', 'for_children', 'has_registration'):
         v = data.get(key)
         if isinstance(v, str) and v.strip().lower() in ('true', 'false'):
             data[key] = v.strip().lower() == 'true'
@@ -25,7 +22,7 @@ def validate_analysis(data):
         v = data.get(key)
         if v is not None and (not isinstance(v, list) or any(not isinstance(x, str) for x in v)):
             raise ValueError('Invalid list: ' + key)
-    for key in ('title', 'date', 'time', 'description', 'location', 'address', 'format'):
+    for key in ('title', 'date', 'time', 'description', 'location', 'address', 'format', 'reg_link'):
         if data.get(key) is not None and not isinstance(data[key], str):
             raise ValueError('Invalid text: ' + key)
     if data.get('date'):
@@ -228,6 +225,8 @@ JSON-структура:
   "time": "HH:MM или null",
   "is_free": true/false/null,
   "price": "минимальная цена ТОЛЬКО цифрами или null",
+  "has_registration": true/false,
+  "reg_link": "точный URL для регистрации на это событие из ссылок поста или null",
   "for_children": true/false/null,
   "format": "offline/online/unknown",
   "location": "название места проведения или null",
@@ -255,7 +254,10 @@ JSON-структура:
 - Бесплатно С УСЛОВИЕМ — это НЕ is_free = true: "бесплатно для новых клиентов", "бесплатно первым 10", "по промокоду", "при покупке", "первое/пробное занятие бесплатно", "бесплатно для подписчиков / участников клуба / резидентов". Если цена при этом не указана — is_free = null; если указана — is_free = false и price
 - Слово "бесплатно" про подарок, консультацию, разбор, диагностику, дегустацию, бонус, раздатку — не делает само мероприятие бесплатным: решай по цене входа
 - is_free = false если указана любая цена (кроме 0), есть "купить билет", "билеты от", "стоимость", ссылка на продажу билетов (timepad/kassir/afisha/qtickets/ticketscloud/radario)
+- Если "билеты по ссылке" сопровождаются скидкой на билеты или промокодом на покупку, ставь is_free = false даже без суммы и на сайте самого организатора. Явно бесплатный вход или бесплатные билеты — is_free = true.
 - Одна только "регистрация" или "запись" (ссылка, бот, телефон) без цены и без слов о бесплатности — is_free = null: у бесплатных мероприятий тоже бывает регистрация
+- has_registration = true, если в посте предлагают или требуют записаться или зарегистрироваться на это событие; это отдельный признак вне зависимости от оплаты. Обычная ссылка на сайт, канал или покупку билета сама по себе не означает регистрацию.
+- Для reg_link бери только точную ссылку, указанную в посте для записи на это событие. Если записываются по телефону, в личных сообщениях без ссылки или ссылка неясна, верни null.
 - is_free = null если нет никаких признаков цены
 - price = минимальная цена ТОЛЬКО цифрами, без слов и валюты, например "1500" (НЕ "от 1500 рублей", НЕ "1500 руб", НЕ "от 1500"). null если бесплатно или неизвестно
 - location = название клуба/кафе/площадки. MAX, Telegram, WhatsApp, VK — это мессенджеры/соцсети, не место проведения, location = null
@@ -328,7 +330,7 @@ async def screen_post(text: str) -> tuple[bool, str | None]:
     return True, None
 
 
-async def analyze_post(text: str, post_date: str = '', categories: dict = {}) -> dict | None:
+async def analyze_post(text: str, post_date: str = '', categories: dict = {}, post_links: dict | None = None) -> dict | None:
     if not text or len(text.strip()) < 20:
         return None
 
@@ -337,8 +339,12 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
 
     post_year = post_date[:4] if post_date and len(post_date) >= 4 and post_date[:4].isdigit() else 'неизвестен'
 
+    post_links = post_links or {}
+    post_text = text[:3000]
+    if post_links:
+        post_text += '\n\nСсылки из поста (URL → текст ссылки):\n' + json.dumps(post_links, ensure_ascii=False)
     prompt = PROMPT_TEMPLATE.format(
-        text=text[:3000],
+        text=post_text,
         post_date=post_date,
         post_year=post_year,
         l1_list=l1_list,
@@ -372,6 +378,9 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
                 if isinstance(data, list):
                     data = data[0] if data else None
                 data = validate_analysis(data)
+                reg_link = (data.get('reg_link') or '').strip()
+                data['reg_link'] = reg_link if reg_link in post_links else None
+                data['has_registration'] = data.get('has_registration') is True or data['reg_link'] is not None
                 if data and isinstance(data.get('category_l2_arr'), list):
                     data['category_l2_arr'] = [x.lower() for x in data['category_l2_arr']]
                 if data and categories:
