@@ -1,11 +1,7 @@
-# database.py — v11
+# database.py — v12
+# v12 (2026-11-20): Persist pass cursors and qualified outcomes; scope early duplicates to city and venue.
 # v11 — Supplemental candidates, persistent manual review and resumable backfill.
 # Requires migration_20261109_dup_extra_review.sql. Updated 09.11.2026.
-# v10 — task 56, «кого оставить»: the price counts as known when the text field is filled OR the «бесплатно» flag
-#       (events.is_free) is on. They are separate columns; counting only the text made all seven «Октоберфест»
-#       copies look equally empty and the survivor was the single card that said nothing about the price — it also
-#       drops out of the «Бесплатно» filter in search. Same change in the add-bot v86. No migration. Updated 22.10.2026
-#
 # Earlier versions: archive/versions_history.md.
 import os
 import json
@@ -77,26 +73,30 @@ def mark_post_processed(channel: str, message_id: int):
         conn.commit()
     except Exception as e:
         logging.error(f"mark_post_processed error: {e}")
+        raise
     finally:
         conn.close()
 
-def event_exists(title: str, date: str) -> bool:
-    if not title or not date:
+def event_exists(title: str, date: str, city=None, location=None) -> bool:
+    if not title or not date or not city or not location or not location.strip():
         return False
     conn = get_conn()
     c = conn.cursor()
     # patch 1: only visible events (published or queued) block saving; drafts/moderation/deleted/rejected/duplicates don't
     c.execute('''
         SELECT 1 FROM events WHERE title=%s AND date=%s
+        AND lower(btrim(COALESCE(NULLIF(city_parsed->>0, ''), city))) = lower(btrim(%s))
+        AND lower(btrim(location)) = lower(btrim(%s))
         AND (COALESCE(is_ignored, false) = false OR ignored_reason = 'queue')
-    ''', (title, date))
+    ''', (title, date, city, location))
     result = c.fetchone()
     conn.close()
     return result is not None
 
 def save_event(event: dict):
     """v5: returns the id of the saved event, or None. The parser keeps using it as a yes/no check."""
-    if event_exists(event.get('title', ''), event.get('date', '')):
+    city = (event.get('city_parsed') or [None])[0] or event.get('city')
+    if event_exists(event.get('title', ''), event.get('date', ''), city, event.get('location')):
         return None
     conn = get_conn()
     c = conn.cursor()
@@ -114,16 +114,19 @@ def save_event(event: dict):
         ''', event)
         row = c.fetchone()
         new_id = row['id'] if row else None
-        if row and event.get('description'):
+        if row and event.get('description') and city and str(event.get('location') or '').strip():
             c.execute('''
                 SELECT id FROM events 
                 WHERE date = %s 
                 AND description IS NOT NULL
                 AND similarity(description, %s) > 0.95
+                AND lower(btrim(COALESCE(NULLIF(city_parsed->>0, ''), city))) = lower(btrim(%s))
+                AND lower(btrim(location)) = lower(btrim(%s))
+                AND EXISTS (SELECT 1 FROM bot_settings WHERE key='dup_auto' AND lower(value) IN ('on','true','1','yes'))
                 AND id != %s
                 AND (COALESCE(is_ignored, false) = false OR ignored_reason = 'queue')
                 LIMIT 1
-            ''', (event.get('date'), event.get('description'), new_id))
+            ''', (event.get('date'), event.get('description'), city, event.get('location'), new_id))
             duplicate = c.fetchone()
             if duplicate:
                 c.execute('''
@@ -137,23 +140,26 @@ def save_event(event: dict):
         return new_id
     except Exception as e:
         logging.error(f"save_event error: {e}")
+        conn.rollback()
         conn.close()
-        return None
+        raise
 
-def log_parse(channel: str, post_id: str, model: str, fallback: bool, success: bool, error: str = None, category_l1_arr: list = [], category_l2_arr: list = [], stage: str = 'analyze'):
+def log_parse(channel: str, post_id: str, model: str, fallback: bool, success: bool, error: str = None, category_l1_arr: list = [], category_l2_arr: list = [], stage: str = 'analyze', qualified=None, metrics_version=0):
     conn = get_conn()
     c = conn.cursor()
     try:
         c.execute('''
-            INSERT INTO parse_logs (channel, post_id, model, fallback, success, error, category_l1_arr, category_l2_arr, stage)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO parse_logs (channel, post_id, model, fallback, success, error, category_l1_arr, category_l2_arr, stage, qualified, metrics_version)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ''', (channel, post_id, model, fallback, success, error,
               json.dumps(category_l1_arr, ensure_ascii=False),
               json.dumps(category_l2_arr, ensure_ascii=False),
-              stage))
+              stage, qualified, metrics_version))
         conn.commit()
     except Exception as e:
         logging.error(f"log_parse error: {e}")
+        if metrics_version:
+            raise
     finally:
         conn.close()
 
@@ -1035,3 +1041,57 @@ def set_setting(key: str, value: str) -> bool:
         return False
     finally:
         conn.close()
+
+
+class ParserPass:
+    """Persistent channel cursor; a session lock prevents concurrent pass owners."""
+    def __init__(self, scope):
+        self.scope = scope
+        self.conn = None
+        self.locked = False
+
+    def __enter__(self):
+        self.conn = get_conn()
+        try:
+            with self.conn.cursor() as c:
+                c.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS locked", ('parser-pass:' + self.scope,))
+                self.locked = c.fetchone()['locked']
+            self.conn.commit()
+            return self
+        except Exception:
+            self.conn.close()
+            raise
+
+    def begin(self, channels, backup):
+        with self.conn.cursor() as c:
+            c.execute("SELECT *, completed_at >= date_trunc('day',now() AT TIME ZONE 'Europe/Moscow') AT TIME ZONE 'Europe/Moscow' AS done_today FROM parser_passes WHERE scope=%s", (self.scope,))
+            row = c.fetchone()
+            if row and row['completed_at'] is None:
+                self.next_index = row['next_index']
+                self.channels = row['channels']
+                self.conn.commit()
+                return self.channels
+            if row and backup and row['done_today']:
+                return None
+            c.execute("INSERT INTO parser_passes(scope,channels,next_index,completed_at) VALUES (%s,%s::jsonb,0,NULL) ON CONFLICT(scope) DO UPDATE SET channels=excluded.channels,next_index=0,completed_at=NULL,started_at=now(),updated_at=now()", (self.scope,json.dumps(channels)))
+        self.conn.commit()
+        self.next_index = 0
+        self.channels = channels
+        return channels
+
+    def advance(self, index):
+        with self.conn.cursor() as c:
+            c.execute("UPDATE parser_passes SET next_index=%s,updated_at=now(),completed_at=CASE WHEN %s>=jsonb_array_length(channels) THEN now() ELSE NULL END WHERE scope=%s", (index,index,self.scope))
+        self.conn.commit()
+        self.next_index = index
+
+    def __exit__(self, *args):
+        if self.conn:
+            try:
+                self.conn.rollback()
+                if self.locked:
+                    with self.conn.cursor() as c:
+                        c.execute("SELECT pg_advisory_unlock(hashtext(%s))", ('parser-pass:' + self.scope,))
+                    self.conn.commit()
+            finally:
+                self.conn.close()
