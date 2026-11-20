@@ -1,4 +1,5 @@
-# main.py — v2
+# main.py — v3
+# v3 (2026-11-20): Let the persistent parser pass decide whether a backup run is needed.
 # v2 — notify() moved to notify.py (parser.py uses it too); behaviour unchanged. Updated 14.10.2026
 import asyncio
 import os
@@ -16,12 +17,6 @@ logging.basicConfig(
 
 async def main():
     logging.info("Starting Events Bot...")
-    is_backup = os.environ.get('IS_BACKUP_RUN') == '1'
-    if is_backup:
-        if has_session_today():
-            logging.info("Сессия сегодня уже была. Резервный запуск не нужен.")
-            return
-        await notify("⚠️ Основной парсер не запустился сегодня. Запускаю резервный.")
     await start_scheduler()
 
 if __name__ == "__main__":
