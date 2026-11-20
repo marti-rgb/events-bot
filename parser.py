@@ -1,11 +1,8 @@
-# parser.py — ВЕРСИЯ v50 — 21.10.2026
+# parser.py — v51
+# v51 (2026-11-20): Resume incomplete passes; record qualified posts before deduplication; mark after persistence.
 # v50 — task 56: after every saved event the semantic duplicate check runs (dedup.py), wrapped so that any of its
 # failures only get logged and reported once per run — parsing itself never stops. The run ends with one summary
 # line about duplicates. Needs dedup.py v1, database.py v5 and migration_20261021_dup.sql. Updated 21.10.2026
-# v49 — справочник категорий: Google-лист → копия в базе (categories_catalog, обновляется после каждого удачного
-# чтения листа) → вшитый список в коде; фильтр категорий больше не отключается. Справочник не из листа или копия
-# в базе не обновилась — сообщение админу (notify.py). Updated 14.10.2026
-#
 # История версий (старше двух последних) — в versions_history.md
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
@@ -18,7 +15,7 @@ import time
 import httpx
 from bs4 import BeautifulSoup
 from analyzer import analyze_post, screen_post
-from database import log_parse, start_parse_session, finish_parse_session
+from database import log_parse, start_parse_session, finish_parse_session, ParserPass
 from database import is_post_processed, mark_post_processed, save_event, log_rejected_post
 from database import load_categories_db, save_categories_db
 from sheets_config import load_channels, load_keywords, load_categories, match_category_l2, load_stop_tags, UNAVAILABLE_CHANNELS, CATEGORIES_FALLBACK
@@ -102,7 +99,7 @@ async def _fetch_one_page(client: httpx.AsyncClient, channel: str, url: str) -> 
         response = await client.get(url, headers=HEADERS, timeout=15)
         if response.status_code != 200:
             logging.error(f"❌ @{channel} недоступен: HTTP {response.status_code}")
-            return []
+            raise RuntimeError(f'@{channel}: HTTP {response.status_code}')
         
         soup = BeautifulSoup(response.text, 'html.parser')
         messages = soup.find_all('div', class_='tgme_widget_message')
@@ -133,7 +130,7 @@ async def _fetch_one_page(client: httpx.AsyncClient, channel: str, url: str) -> 
         return posts
     except Exception as e:
         logging.error(f"❌ Ошибка получения @{channel}: {e}")
-        return []
+        raise
 
 async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_keywords: list = [], categories: dict = {}, stop_tags: list = []):
     channel = channel_config['channel']
@@ -197,8 +194,11 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 model=screen_model or 'none',
                 fallback=bool(screen_model and not screen_model.startswith('zai/')),
                 success=screen_model is not None,
-                stage='screen',
+                stage='screen', qualified=False if screen_model is not None and not is_event else None, metrics_version=1,
             )
+            if screen_model is None:
+                error += 1
+                continue
             if not is_event:
                 mark_post_processed(channel, int(msg_id))
                 skipped += 1
@@ -217,14 +217,13 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             category_l1_arr=result.get('category_l1_arr', []) if result else [],
             category_l2_arr=result.get('category_l2_arr', []) if result else [],
             stage='analyze',
+            qualified=(bool(result.get('is_event') and result.get('date')) if result else None), metrics_version=1,
         )
-        if result:
-            mark_post_processed(channel, int(msg_id))
-
         if result and not result.get('is_event'):
             snippet = post['text'][:200].strip().replace('\n', ' ')
             logging.info(f"❌ @{channel}/{msg_id} НЕ событие (оригинал поста): {snippet!r}")
             log_rejected_post(channel, str(msg_id), post['text'])
+            mark_post_processed(channel, int(msg_id))
 
         if result and result.get('is_event') and result.get('date'):
             event = {
@@ -247,6 +246,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 'model': result.get('model'),
             }
             new_event_id = save_event(event)  # v5: the id of the saved event, None if it was not saved
+            mark_post_processed(channel, int(msg_id))
             if new_event_id:
                 if len(result.get('category_l1_arr', [])) >= 16:
                     mark_post_processed(channel, int(msg_id))
@@ -296,10 +296,12 @@ async def load_categories_safe() -> dict:
     return cats
 
 
-async def run_parser():
+async def _run_parser_pass(progress):
     logging.info("Начинаем парсинг через t.me/s/...")
     
     CHANNELS = load_channels()
+    if not CHANNELS:
+        raise RuntimeError('Список каналов не загружен; проход не изменён')
 
     # Обработать только часть списка каналов. Формат "N/M", например "2/5" —
     # вторая пятая часть. Пусто или "1/1" — все каналы (обычный режим).
@@ -316,6 +318,10 @@ async def run_parser():
         except ValueError:
             logging.warning(f"CHANNELS_PART='{part}' — не понял формат, беру все каналы")
 
+    CHANNELS = progress.begin(CHANNELS, os.getenv('IS_BACKUP_RUN') == '1')
+    if CHANNELS is None:
+        logging.info('Завершённый проход сегодня уже был; резервный запуск пропущен')
+        return 0, 0
     FILTER_KEYWORDS = load_keywords()
     CATEGORIES = await load_categories_safe()  # patch 1 (v49)
     STOP_TAGS = load_stop_tags()
@@ -329,6 +335,7 @@ async def run_parser():
     total_saved = 0
     total_skipped = 0
     total_error = 0
+    channels_done = 0
 
     github_run_id = os.environ.get('GITHUB_RUN_ID')
     github_run_url = f"https://github.com/marti-rgb/events-bot/actions/runs/{github_run_id}" if github_run_id else None
@@ -336,7 +343,8 @@ async def run_parser():
     
     run_started = time.monotonic()
     async with httpx.AsyncClient() as client:
-        for idx, channel_config in enumerate(CHANNELS):
+        for idx in range(progress.next_index, len(CHANNELS)):
+            channel_config = CHANNELS[idx]
             elapsed_min = (time.monotonic() - run_started) / 60
             if elapsed_min > MAX_RUN_MINUTES:
                 left = len(CHANNELS) - idx
@@ -354,6 +362,11 @@ async def run_parser():
             total_saved += saved
             total_skipped += skipped
             total_error += error
+            if error:
+                await notify(f"⚠️ @{channel}: есть незавершённые посты. Следующий запуск продолжит с этого канала.")
+                break
+            progress.advance(idx + 1)
+            channels_done += 1
             logging.info(f"@{channel}: получено {fetched}, обработано {processed}, сохранено {saved}")
             await asyncio.sleep(2)
 
@@ -364,7 +377,7 @@ async def run_parser():
             'saved': total_saved,
             'skipped': total_skipped,
             'error': total_error,
-            'channels': len(CHANNELS)
+            'channels': channels_done
         })
     logging.info(f"Готово. Получено: {total_fetched}, обработано: {total_processed}, сохранено: {total_saved}")
 
@@ -377,3 +390,15 @@ async def run_parser():
             logging.error(f"Итог по дублям не отправлен: {e}")
 
     return total_processed, total_saved
+
+async def run_parser():
+    scope = (os.getenv('CHANNELS_PART') or 'all') + ':' + (PARSE_SINCE or '')
+    try:
+        with ParserPass(scope) as progress:
+            if not progress.locked:
+                logging.info('Другой запуск уже обрабатывает эту часть каналов')
+                return 0, 0
+            return await _run_parser_pass(progress)
+    except Exception as exc:
+        await notify('⚠️ Парсер остановлен; место продолжения сохранено: ' + str(exc)[:250])
+        raise
