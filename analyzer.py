@@ -1,19 +1,39 @@
-# analyzer.py — ВЕРСИЯ v45 — 14.10.2026
+# analyzer.py — v46
+# v46 (2026-11-20): Validate model payload types and event dates.
 # v45 — sections (L1) are always brought to the справочник: the AI's answer is fitted by spelling (case, word order,
 # part of the name: «искусство и культура» → «Культура и искусство», «Бизнес» → «Бизнес и нетворкинг»); if nothing fits
 # and the post is an event — a short second request asks the AI to pick 1–2 sections from the list; if no model answers,
 # the post is returned as not processed (retried next run) instead of being thrown away. Every fit is logged. Updated 14.10.2026
-# v44 — правило цены в промпте: «бесплатно» только если бесплатен вход/участие для всех;
-# бесплатно с условием («для новых клиентов», «первым N», «по промокоду», «при покупке»,
-# «первое/пробное занятие бесплатно», «для подписчиков/участников клуба») → is_free = null
-# (цена не указана), если цены нет; слово «бесплатно» про подарок/консультацию/разбор/бонус
-# не делает мероприятие бесплатным; одна только регистрация/запись без цены → null, а не false
-# (у бесплатных мероприятий тоже бывает регистрация). Случай 26984: «Бесплатно для новых
-# клиентов центра…» — на сайте 7500 ₽. Обновлено 11.10.2026
-#
 # История версий (старше двух последних) — в versions_history.md
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
+
+def validate_analysis(data):
+    """Validate the model payload before category fitting and persistence."""
+    from datetime import date
+    if not isinstance(data, dict):
+        raise ValueError('Model result must be an object')
+    for key in ('is_event', 'is_free', 'for_children'):
+        v = data.get(key)
+        if isinstance(v, str) and v.strip().lower() in ('true', 'false'):
+            data[key] = v.strip().lower() == 'true'
+        elif v is not None and not isinstance(v, bool):
+            raise ValueError('Invalid boolean: ' + key)
+    if not isinstance(data.get('is_event'), bool):
+        raise ValueError('Missing is_event')
+    for key in ('category_l1_arr', 'category_l2_arr', 'city_parsed'):
+        v = data.get(key)
+        if v is not None and (not isinstance(v, list) or any(not isinstance(x, str) for x in v)):
+            raise ValueError('Invalid list: ' + key)
+    for key in ('title', 'date', 'time', 'description', 'location', 'address', 'format'):
+        if data.get(key) is not None and not isinstance(data[key], str):
+            raise ValueError('Invalid text: ' + key)
+    if data.get('date'):
+        date.fromisoformat(data['date'])
+    if data['is_event'] and (not str(data.get('title') or '').strip() or not data.get('date')):
+        raise ValueError('Event title/date missing')
+    return data
+
 import os
 import re
 import json
@@ -351,6 +371,7 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}) ->
                 data = json.loads(raw.strip())
                 if isinstance(data, list):
                     data = data[0] if data else None
+                data = validate_analysis(data)
                 if data and isinstance(data.get('category_l2_arr'), list):
                     data['category_l2_arr'] = [x.lower() for x in data['category_l2_arr']]
                 if data and categories:
