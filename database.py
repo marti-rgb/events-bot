@@ -1,7 +1,6 @@
-# database.py — v12
+# database.py — v13
+# v13 (2026-11-20): Persist registration requirements and verified post links.
 # v12 (2026-11-20): Persist pass cursors and qualified outcomes; scope early duplicates to city and venue.
-# v11 — Supplemental candidates, persistent manual review and resumable backfill.
-# Requires migration_20261109_dup_extra_review.sql. Updated 09.11.2026.
 # Earlier versions: archive/versions_history.md.
 import os
 import json
@@ -106,9 +105,15 @@ def save_event(event: dict):
         event['category_l1_arr'] = json.dumps(event.get('category_l1_arr', []), ensure_ascii=False)
         event['category_l2_arr'] = json.dumps(event.get('category_l2_arr', []), ensure_ascii=False)
         event['city_parsed'] = json.dumps(event.get('city_parsed', []), ensure_ascii=False)
+        event.setdefault('has_registration', False)
+        event.setdefault('reg_link', None)
         c.execute('''
-            INSERT INTO events (title, date, time, is_free, for_children, format, category_l1_arr, category_l2_arr, description, location, address, price, source_url, channel, city, model, city_parsed)
-            VALUES (%(title)s, %(date)s, %(time)s, %(is_free)s, %(for_children)s, %(format)s, %(category_l1_arr)s, %(category_l2_arr)s, %(description)s, %(location)s, %(address)s, %(price)s, %(source_url)s, %(channel)s, %(city)s, %(model)s, %(city_parsed)s)
+            INSERT INTO events (title, date, time, is_free, for_children, format, category_l1_arr, category_l2_arr,
+                                description, location, address, price, source_url, channel, city, model, city_parsed,
+                                has_registration, reg_link)
+            VALUES (%(title)s, %(date)s, %(time)s, %(is_free)s, %(for_children)s, %(format)s, %(category_l1_arr)s, %(category_l2_arr)s,
+                    %(description)s, %(location)s, %(address)s, %(price)s, %(source_url)s, %(channel)s, %(city)s, %(model)s,
+                    %(city_parsed)s, %(has_registration)s, %(reg_link)s)
             ON CONFLICT (source_url) WHERE ignored_reason IS DISTINCT FROM 'manual' DO NOTHING
             RETURNING id
         ''', event)
