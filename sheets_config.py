@@ -1,6 +1,6 @@
-# sheets_config.py — v3 (имя файла не меняется: его импортирует parser.py)
+# sheets_config.py — v4
+# v4 (2026-11-20): Recognize the city column at index zero.
 # v3 — CATEGORIES_FALLBACK: the 16 sections built into the code, last resort when neither the Google sheet nor the database copy answered (patch 1, 14.10.2026). Updated 14.10.2026
-# v2 — выгрузка листов Google с headers=1: заголовок всегда одна строка (фикс 0 каналов 03–04.10.2026). Обновлено 04.10.2026
 import os
 import httpx
 import logging
@@ -35,7 +35,7 @@ def load_channels() -> list[dict]:
             channel = row[channel_idx].strip()
             if not channel:
                 continue
-            city = row[city_idx].strip() if city_idx and len(row) > city_idx else 'Москва'
+            city = row[city_idx].strip() if city_idx is not None and len(row) > city_idx else 'Москва'
 
             status_idx = header.index('статус') if 'статус' in header else None
             status = row[status_idx].strip().lower() if status_idx is not None and len(row) > status_idx else 'активный'
