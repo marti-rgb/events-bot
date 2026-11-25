@@ -1,0 +1,170 @@
+# diagnose_posts.yml — v1, 2026-11-26
+name: Diagnose Two Parser Posts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install parser dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install psycopg2-binary==2.9.9
+      - name: Fetch two posts and inspect model responses
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          ANALYZE_THINKING: ${{ vars.ANALYZE_THINKING || '0' }}
+        run: |
+          python - <<'PYTHON'
+          import asyncio
+          import json
+          import logging
+          import os
+
+          import httpx
+
+          import analyzer
+          from parser import _fetch_one_page
+          from sheets_config import load_categories
+
+          TARGETS = (("dostlibrary", "1791"), ("kids_msk_afisha", "4300"))
+          MASKED_VALUES = tuple(filter(None, (
+              os.getenv("GROQ_API_KEY"), os.getenv("ZAI_API_KEY"), os.getenv("SHEET_ID"),
+          )))
+
+          # Keep multiline public text and model output on a single log line.
+          def report(label, value):
+              line = json.dumps(value, ensure_ascii=False, default=str)
+              for secret in MASKED_VALUES:
+                  line = line.replace(secret, "***")
+              print(f"{label}: {line}", flush=True)
+
+          def model_reply(provider, client, model, prompt, max_tokens, thinking, label):
+              try:
+                  response = analyzer._chat(
+                      provider, client, model, prompt, max_tokens=max_tokens,
+                      temperature=0.1, thinking=thinking,
+                  )
+              except Exception as exc:
+                  report(label, {
+                      "ошибка запроса": type(exc).__name__,
+                      "HTTP": getattr(exc, "status_code", None),
+                  })
+                  return None
+              choice = response.choices[0] if response.choices else None
+              content = choice.message.content if choice else None
+              usage = getattr(response, "usage", None)
+              completion_details = getattr(usage, "completion_tokens_details", None)
+              report(label, {
+                  "причина завершения": getattr(choice, "finish_reason", None),
+                  "токенов ответа": getattr(usage, "completion_tokens", None),
+                  "из них токенов рассуждения": getattr(completion_details, "reasoning_tokens", None),
+                  "ответ": content,
+              })
+              return content
+
+          async def main():
+              # The parser's regular logger can include request URLs and exception bodies.
+              logging.disable(logging.CRITICAL)
+              categories = load_categories()
+              if not categories:
+                  raise SystemExit("Справочник категорий не загрузился. Запросы к моделям не отправлены.")
+              report("Категорий в справочнике", len(categories))
+              report("Размышления при разборе", analyzer.ANALYZE_THINKING)
+              if not any(client is not None for _, client, _ in analyzer.ANALYZE_CHAIN):
+                  raise SystemExit("Ни одна модель не настроена.")
+
+              missing_posts = []
+              async with httpx.AsyncClient() as telegram:
+                  for channel, post_id in TARGETS:
+                      url = f"https://t.me/{channel}/{post_id}"
+                      report("Пост", url)
+                      try:
+                          posts = await _fetch_one_page(
+                              telegram, channel, f"https://t.me/s/{channel}?before={int(post_id) + 1}",
+                          )
+                      except Exception as exc:
+                          report("Ошибка чтения страницы Telegram", type(exc).__name__)
+                          missing_posts.append(url)
+                          continue
+                      post = next((item for item in posts if item["id"] == post_id), None)
+                      if post is None:
+                          report("Пост не найден в веб-версии Telegram", url)
+                          missing_posts.append(url)
+                          continue
+
+                      # Use the same template and input formatting as analyze_post.
+                      post_date = post["post_date"]
+                      year = post_date[:4] if len(post_date) >= 4 and post_date[:4].isdigit() else "неизвестен"
+                      post_text = post["text"][:3000]
+                      if post["links"]:
+                          post_text += "\n\nСсылки из поста (URL → текст ссылки):\n" + json.dumps(
+                              post["links"], ensure_ascii=False,
+                          )
+                      report("Дата публикации, считанная парсером", post_date or None)
+                      report("Год, переданный модели", year)
+                      report("Начало текста, считанного парсером", post["text"][:400])
+                      prompt = analyzer.PROMPT_TEMPLATE.format(
+                          text=post_text, post_date=post_date, post_year=year,
+                          l1_list="/".join(categories), l2_json=json.dumps(categories, ensure_ascii=False),
+                      )
+                      for provider, client, model in analyzer.ANALYZE_CHAIN:
+                          report("Модель", f"{provider}/{model}")
+                          if client is None:
+                              report("Доступность", "Ключ модели не настроен")
+                              continue
+                          raw = model_reply(
+                              provider, client, model, prompt, 6000 if analyzer.ANALYZE_THINKING else 2000,
+                              analyzer.ANALYZE_THINKING, "Исходный ответ",
+                          )
+                          if not raw or not raw.strip():
+                              continue
+                          try:
+                              payload = json.loads(analyzer._strip_fence(raw))
+                              if isinstance(payload, list):
+                                  payload = payload[0] if payload else None
+                              if isinstance(payload, dict):
+                                  report("Поля ответа", {k: payload.get(k) for k in ("is_event", "title", "date")})
+                              result = analyzer.validate_analysis(payload)
+                          except ValueError as exc:
+                              report("Ошибка проверки ответа", str(exc))
+                          else:
+                              if result["is_event"]:
+                                  continue
+
+                          followup = (
+                              "Кратко объясни результат предыдущего разбора анонса. "
+                              "Если название или дата пусты, укажи, какого поля не хватает и почему. "
+                              "Если пост признан не событием, укажи конкретную причину. "
+                              "Приведи относящуюся к делу строку поста, если она есть. "
+                              "Используй год публикации для даты без года. "
+                              "Если причину по этим данным определить нельзя, скажи об этом прямо. "
+                              "Ответь по-русски в двух коротких предложениях.\n\n"
+                              f"Дата публикации: {post_date or 'неизвестна'}. Год: {year}.\n"
+                              f"Пост: {post_text}\n\nПредыдущий ответ: {raw}"
+                          )
+                          model_reply(
+                              provider, client, model, followup, 450, False,
+                              "Пояснение модели отдельным запросом",
+                          )
+
+              if missing_posts:
+                  raise SystemExit("Не удалось получить все два заданных поста из Telegram.")
+
+          if __name__ == "__main__":
+              asyncio.run(main())
+          PYTHON
