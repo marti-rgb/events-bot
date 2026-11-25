@@ -1,6 +1,6 @@
-# parser.py — v52
+# parser.py — v53
+# v53 (2026-11-25): Record incomplete events for review and continue to the next channel.
 # v52 (2026-11-20): Preserve post links for registration analysis and save registration details.
-# v51 (2026-11-20): Resume incomplete passes; record qualified posts before deduplication; mark after persistence.
 # История версий (старше двух последних) — в versions_history.md
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
@@ -13,7 +13,7 @@ import time
 from urllib.parse import urlsplit
 import httpx
 from bs4 import BeautifulSoup
-from analyzer import analyze_post, screen_post
+from analyzer import IncompleteEventError, analyze_post, screen_post
 from database import log_parse, start_parse_session, finish_parse_session, ParserPass
 from database import is_post_processed, mark_post_processed, save_event, log_rejected_post
 from database import load_categories_db, save_categories_db
@@ -160,10 +160,9 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
     processed = 0
     skipped = 0
     error = 0
+    deferred = 0
 
     posts = await fetch_channel_posts(client, channel)
-    if not posts:
-        return 0, 0, 0, 0, 0
     fetched = len(posts)
     
     for post in posts:
@@ -223,7 +222,27 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 continue
 
         processed += 1
-        result = await analyze_post(post['text'], post.get('post_date', ''), categories, post.get('links'))
+        try:
+            result = await analyze_post(post['text'], post.get('post_date', ''), categories, post.get('links'))
+        except IncompleteEventError:
+            post_url = post['url']
+            log_parse(
+                channel=channel,
+                post_id=str(msg_id),
+                model=None,
+                fallback=False,
+                success=False,
+                error=f'Отложено на разбор: нет названия или даты. {post_url}',
+                stage='analyze',
+                metrics_version=1,
+            )
+            # Save the review link before preventing further automatic analysis of this post.
+            mark_post_processed(channel, int(msg_id))
+            deferred += 1
+            logging.warning(f"Отложено на разбор: нет названия или даты. {post_url}")
+            await notify(f"⚠️ Пост отложен на разбор: нет названия или даты события.\n{post_url}")
+            await asyncio.sleep(1.5)
+            continue
         if not result:
             error += 1
         log_parse(
@@ -283,7 +302,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
         
         await asyncio.sleep(1.5)
     
-    return fetched, processed, saved, skipped, error
+    return fetched, processed, saved, skipped, error, deferred
 
 
 # ===== patch 1 (v49): справочник категорий never empty =====
@@ -376,12 +395,14 @@ async def _run_parser_pass(progress):
                 break
             channel = channel_config['channel']
             logging.info(f"Парсим @{channel}...")
-            fetched, processed, saved, skipped, error = await parse_channel(client, channel_config, FILTER_KEYWORDS, CATEGORIES, STOP_TAGS)
+            fetched, processed, saved, skipped, error, deferred = await parse_channel(
+                client, channel_config, FILTER_KEYWORDS, CATEGORIES, STOP_TAGS,
+            )
             total_fetched += fetched
             total_processed += processed
             total_saved += saved
             total_skipped += skipped
-            total_error += error
+            total_error += error + deferred
             if error:
                 await notify(f"⚠️ @{channel}: есть незавершённые посты. Следующий запуск продолжит с этого канала.")
                 break

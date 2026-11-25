@@ -1,9 +1,13 @@
-# analyzer.py — v47
+# analyzer.py — v48
+# v48 (2026-11-25): Distinguish missing event details from failed requests after trying all available models.
 # v47 (2026-11-20): Identify registration separately and recognize explicit ticket sales without a price.
-# v46 (2026-11-20): Validate model payload types and event dates.
 # История версий (старше двух последних) — в versions_history.md
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
+
+class IncompleteEventError(ValueError):
+    """A model identified an event without a title or date."""
+
 
 def validate_analysis(data):
     """Validate the model payload before category fitting and persistence."""
@@ -28,7 +32,7 @@ def validate_analysis(data):
     if data.get('date'):
         date.fromisoformat(data['date'])
     if data['is_event'] and (not str(data.get('title') or '').strip() or not data.get('date')):
-        raise ValueError('Event title/date missing')
+        raise IncompleteEventError('Event title/date missing')
     return data
 
 import os
@@ -356,6 +360,8 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}, po
 
     for attempt in (1, 2):
         rate_limited = False
+        incomplete_event = None
+        other_failure = False
         for provider, client, model in ANALYZE_CHAIN:
             if client is None:
                 continue
@@ -366,6 +372,7 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}, po
                                  thinking=ANALYZE_THINKING)
                 raw = response.choices[0].message.content
                 if not raw:
+                    other_failure = True
                     continue
                 raw = raw.strip()
 
@@ -406,15 +413,22 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}, po
                 return data
 
             except json.JSONDecodeError as e:
+                other_failure = True
                 logging.warning(f"JSON parse error {model_used}: {e}")
                 continue
             except Exception as e:
-                if _is_rate_limit(e):
+                if isinstance(e, IncompleteEventError):
+                    incomplete_event = e
+                    logging.warning(f"{model_used}: {e}")
+                elif _is_rate_limit(e):
+                    other_failure = True
                     rate_limited = True
                     last_rate_err = e
                     logging.warning(f"rate limit {model_used} — следующая модель")
                     continue
-                logging.error(f"API error {model_used}: {e}")
+                else:
+                    other_failure = True
+                    logging.error(f"API error {model_used}: {e}")
                 log_parse(
                     channel='',
                     post_id='',
@@ -441,4 +455,6 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}, po
             success=False,
             error=f"rate limit на всех моделях: {str(last_rate_err)[:400]}"
         )
+    if incomplete_event is not None and not other_failure:
+        raise incomplete_event
     return None
