@@ -1,5 +1,7 @@
-# diagnose_posts.yml — v1, 2026-11-26
-name: Diagnose Two Parser Posts
+# diagnose_posts.yml — v2, 2026-11-26
+# v2: Read today's deferred posts and unfinished @terragames posts from the parser log.
+# v1: Diagnose two posts by comparing the models' original responses.
+name: Diagnose Parser Posts
 
 on:
   workflow_dispatch:
@@ -22,8 +24,9 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install psycopg2-binary==2.9.9
-      - name: Fetch two posts and inspect model responses
+      - name: Review deferred and unfinished posts
         env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
@@ -34,17 +37,52 @@ jobs:
           import json
           import logging
           import os
+          from contextlib import closing
+          from datetime import datetime, time, timedelta, timezone
+          from zoneinfo import ZoneInfo
 
           import httpx
 
           import analyzer
+          from database import get_conn
           from parser import _fetch_one_page
           from sheets_config import load_categories
 
-          TARGETS = (("dostlibrary", "1791"), ("kids_msk_afisha", "4300"))
           MASKED_VALUES = tuple(filter(None, (
-              os.getenv("GROQ_API_KEY"), os.getenv("ZAI_API_KEY"), os.getenv("SHEET_ID"),
+              os.getenv("DATABASE_URL"), os.getenv("GROQ_API_KEY"),
+              os.getenv("ZAI_API_KEY"), os.getenv("SHEET_ID"),
           )))
+          MOSCOW = ZoneInfo("Europe/Moscow")
+          DEFERRED_ERROR = "Отложено на разбор: нет названия или даты.%"
+          TARGET_QUERY = """
+              WITH recent AS (
+                  SELECT id, channel, post_id, stage, success,
+                         stage = 'analyze' AND error LIKE %(deferred_error)s AS is_deferred
+                  FROM public.parse_logs
+                  WHERE metrics_version = 1
+                    AND created_at >= %(start)s AND created_at < %(end)s
+                    AND stage IN ('screen', 'analyze')
+                    AND channel ~ '^[A-Za-z0-9_]+$' AND post_id ~ '^[0-9]+$'
+                    AND (channel = 'terragames' OR error LIKE %(deferred_error)s)
+              ), ranked AS (
+                  SELECT channel, post_id, stage, success,
+                         bool_or(is_deferred) OVER (PARTITION BY channel, post_id) AS deferred,
+                         row_number() OVER (PARTITION BY channel, post_id ORDER BY id DESC) AS latest
+                  FROM recent
+              )
+              SELECT channel, post_id, stage, deferred IS TRUE
+              FROM ranked
+              WHERE latest = 1 AND (
+                  deferred IS TRUE OR (
+                      channel = 'terragames' AND success IS FALSE AND NOT EXISTS (
+                          SELECT 1 FROM public.processed_posts AS processed
+                          WHERE processed.channel = ranked.channel
+                            AND processed.message_id::text = ranked.post_id
+                      )
+                  )
+              )
+              ORDER BY deferred IS TRUE DESC, channel, length(post_id), post_id
+          """
 
           # Keep multiline public text and model output on a single log line.
           def report(label, value):
@@ -52,6 +90,25 @@ jobs:
               for secret in MASKED_VALUES:
                   line = line.replace(secret, "***")
               print(f"{label}: {line}", flush=True)
+
+          def load_targets(day):
+              # parse_logs.created_at stores a UTC timestamp without a time zone.
+              start = datetime.combine(day, time.min, tzinfo=MOSCOW)
+              end = start + timedelta(days=1)
+              params = {
+                  "start": start.astimezone(timezone.utc).replace(tzinfo=None),
+                  "end": end.astimezone(timezone.utc).replace(tzinfo=None),
+                  "deferred_error": DEFERRED_ERROR,
+              }
+              try:
+                  with closing(get_conn()) as conn:
+                      conn.set_session(readonly=True)
+                      with conn.cursor() as cursor:
+                          cursor.execute(TARGET_QUERY, params)
+                          return cursor.fetchall()
+              except Exception as exc:
+                  report("Ошибка чтения журнала Supabase", type(exc).__name__)
+                  raise SystemExit(1) from None
 
           def model_reply(provider, client, model, prompt, max_tokens, thinking, label):
               try:
@@ -80,6 +137,17 @@ jobs:
           async def main():
               # The parser's regular logger can include request URLs and exception bodies.
               logging.disable(logging.CRITICAL)
+              day = datetime.now(MOSCOW).date()
+              report("Дата журнала по Москве", day)
+              targets = load_targets(day)
+              deferred_count = sum(deferred for _, _, _, deferred in targets)
+              report("Посты для диагностики", {
+                  "отложены на разбор": deferred_count,
+                  "незавершённые на @terragames": len(targets) - deferred_count,
+              })
+              if not targets:
+                  return
+
               categories = load_categories()
               if not categories:
                   raise SystemExit("Справочник категорий не загрузился. Запросы к моделям не отправлены.")
@@ -90,9 +158,13 @@ jobs:
 
               missing_posts = []
               async with httpx.AsyncClient() as telegram:
-                  for channel, post_id in TARGETS:
+                  for channel, post_id, stage, deferred in targets:
                       url = f"https://t.me/{channel}/{post_id}"
                       report("Пост", url)
+                      report("Отметка в журнале", "отложен на разбор" if deferred else {
+                          "screen": "не завершился предварительный отбор",
+                          "analyze": "не завершился разбор",
+                      }[stage])
                       try:
                           posts = await _fetch_one_page(
                               telegram, channel, f"https://t.me/s/{channel}?before={int(post_id) + 1}",
@@ -118,10 +190,22 @@ jobs:
                       report("Дата публикации, считанная парсером", post_date or None)
                       report("Год, переданный модели", year)
                       report("Начало текста, считанного парсером", post["text"][:400])
+                      if not deferred and stage == "screen":
+                          is_event, model = await analyzer.screen_post(post["text"])
+                          report("Повторный предварительный отбор", {
+                              "модель": model,
+                              "событие": is_event if model else None,
+                          })
+                          continue
+                      if len(post["text"].strip()) < 20:
+                          report("Повторный разбор", "Парсер не отправляет текст короче 20 символов моделям.")
+                          continue
+
                       prompt = analyzer.PROMPT_TEMPLATE.format(
                           text=post_text, post_date=post_date, post_year=year,
                           l1_list="/".join(categories), l2_json=json.dumps(categories, ensure_ascii=False),
                       )
+                      checked_category = False
                       for provider, client, model in analyzer.ANALYZE_CHAIN:
                           report("Модель", f"{provider}/{model}")
                           if client is None:
@@ -144,6 +228,13 @@ jobs:
                               report("Ошибка проверки ответа", str(exc))
                           else:
                               if result["is_event"]:
+                                  if not deferred and not checked_category:
+                                      checked_category = True
+                                      sections, _ = analyzer._fit_l1(result.get("category_l1_arr"), list(categories))
+                                      if not sections:
+                                          sections = analyzer._pick_l1(post["text"], result, list(categories))
+                                      report("Проверка раздела справочника", sections if sections is not None else
+                                             "Дополнительный запрос к моделям не вернул раздел.")
                                   continue
 
                           followup = (
@@ -163,7 +254,8 @@ jobs:
                           )
 
               if missing_posts:
-                  raise SystemExit("Не удалось получить все два заданных поста из Telegram.")
+                  report("Не удалось получить из Telegram", len(missing_posts))
+                  raise SystemExit(1)
 
           if __name__ == "__main__":
               asyncio.run(main())
