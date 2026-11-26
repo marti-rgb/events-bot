@@ -1,6 +1,6 @@
-# parser.py — v53
+# parser.py — v54
+# v54 (2026-11-26): Recover publication dates and reprocess the November 26 deferred posts.
 # v53 (2026-11-25): Record incomplete events for review and continue to the next channel.
-# v52 (2026-11-20): Preserve post links for registration analysis and save registration details.
 # История версий (старше двух последних) — в versions_history.md
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
@@ -10,13 +10,17 @@
 import asyncio
 import logging
 import time
+from contextlib import closing
+from datetime import datetime
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 import httpx
 from bs4 import BeautifulSoup
 from analyzer import IncompleteEventError, analyze_post, screen_post
 from database import log_parse, start_parse_session, finish_parse_session, ParserPass
 from database import is_post_processed, mark_post_processed, save_event, log_rejected_post
 from database import load_categories_db, save_categories_db
+from database import get_conn
 from sheets_config import load_channels, load_keywords, load_categories, match_category_l2, load_stop_tags, UNAVAILABLE_CHANNELS, CATEGORIES_FALLBACK
 from notify import notify
 import os
@@ -32,6 +36,24 @@ except Exception as _dedup_import_error:
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
 }
+MOSCOW = ZoneInfo('Europe/Moscow')
+
+# The exact posts in the completed diagnostic run, including dates that remain unresolved.
+DEFERRED_BATCH = {
+    'artsvao_team': ('1914',),
+    'communitymoscow': ('9796', '9801', '9802'),
+    'freeskidos': ('35270',),
+    'kids_msk_afisha': ('4300',),
+    'kudago': ('45764',),
+    'mammkino': ('613',),
+    'moscowculturelife': ('7744',),
+    'moscowimprovclub': ('5822',),
+    'mosgul': ('26588',),
+    'oteatre': ('11192',),
+    'terragames': ('8348', '8353'),
+    'zaryadye_official': ('20270',),
+}
+REPLAY_STAGE = 'replay_deferred_20261126'
 
 # Сколько страниц истории канала листать назад. 1 страница ≈ 20 постов.
 # Управляется переменной PARSE_PAGES в GitHub → Settings → Variables.
@@ -116,14 +138,11 @@ async def _fetch_one_page(client: httpx.AsyncClient, channel: str, url: str) -> 
             if not text:
                 continue
             
-            date_tag = msg.find('time')
-            post_date = date_tag.get('datetime', '')[:10] if date_tag else ''
-
             posts.append({
                 'id': msg_id,
                 'text': text,
                 'url': f'https://t.me/{channel}/{msg_id}',
-                'post_date': post_date,
+                'post_date': publication_date(msg),
                 'links': post_links(text_div),
             })
         
@@ -131,6 +150,46 @@ async def _fetch_one_page(client: httpx.AsyncClient, channel: str, url: str) -> 
     except Exception as e:
         logging.error(f"❌ Ошибка получения @{channel}: {e}")
         raise
+
+
+def publication_date(message):
+    # The footer belongs to this post. Dates in the text or a reply can refer to other events.
+    selectors = (
+        '.tgme_widget_message_date time[datetime]',
+        '.tgme_widget_message_footer time[datetime]',
+        'time[datetime]',
+    )
+    for selector in selectors:
+        for tag in message.select(selector):
+            parent = tag.find_parent('div', class_='tgme_widget_message')
+            if parent is not message or tag.find_parent(class_=(
+                'tgme_widget_message_text', 'tgme_widget_message_reply', 'tgme_widget_message_forwarded_from',
+            )):
+                continue
+            try:
+                stamp = datetime.fromisoformat(tag['datetime'])
+            except (ValueError, TypeError):
+                continue
+            return (stamp.astimezone(MOSCOW) if stamp.tzinfo else stamp).date().isoformat()
+    return ''
+
+
+async def fetch_embedded_publication_date(client, channel, msg_id):
+    url = f'https://t.me/{channel}/{msg_id}?embed=1&mode=tme'
+    try:
+        response = await client.get(url, headers=HEADERS, timeout=10)
+        if response.status_code == 200:
+            page = BeautifulSoup(response.text, 'html.parser')
+            target = f'{channel}/{msg_id}'.casefold()
+            message = next((msg for msg in page.select('div.tgme_widget_message[data-post]')
+                            if msg['data-post'].casefold() == target), None)
+            if message:
+                return publication_date(message)
+        else:
+            logging.warning(f'@{channel}/{msg_id}: дата публикации недоступна в отдельном посте, HTTP {response.status_code}')
+    except httpx.HTTPError as exc:
+        logging.warning(f'@{channel}/{msg_id}: ошибка чтения отдельного поста, {type(exc).__name__}')
+    return ''
 
 
 def post_links(text_div) -> dict[str, str]:
@@ -150,7 +209,7 @@ def post_links(text_div) -> dict[str, str]:
             break
     return links
 
-async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_keywords: list = [], categories: dict = {}, stop_tags: list = []):
+async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_keywords: list = [], categories: dict = {}, stop_tags: list = [], *, deferred_urls=None, replay_post=None):
     channel = channel_config['channel']
     exclude_ids = [str(i) for i in channel_config.get('exclude_threads', [])]
     whitelist_ids = [str(i) for i in (channel_config.get('threads') or [])]
@@ -162,7 +221,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
     error = 0
     deferred = 0
 
-    posts = await fetch_channel_posts(client, channel)
+    posts = [replay_post] if replay_post is not None else await fetch_channel_posts(client, channel)
     fetched = len(posts)
     
     for post in posts:
@@ -174,13 +233,17 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
         if msg_id in exclude_ids:
             continue
 
-        if PARSE_SINCE:
+        if replay_post is None:
             post_date_val = post.get('post_date') or ''
-            if not post_date_val or post_date_val < PARSE_SINCE:
+            if PARSE_SINCE and post_date_val and post_date_val < PARSE_SINCE:
                 continue
-        
-        if is_post_processed(channel, int(msg_id)):
-            continue
+            if is_post_processed(channel, int(msg_id)):
+                continue
+            if PARSE_SINCE and not post_date_val:
+                post_date_val = await fetch_embedded_publication_date(client, channel, msg_id)
+                if not post_date_val or post_date_val < PARSE_SINCE:
+                    continue
+                post['post_date'] = post_date_val
         
         if filter_keywords:
             text_lower = post['text'].lower()
@@ -221,6 +284,11 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
                 skipped += 1
                 continue
 
+        if not post.get('post_date'):
+            post['post_date'] = await fetch_embedded_publication_date(client, channel, msg_id)
+        if replay_post is not None:
+            logging.info(f"@{channel}/{msg_id}: дата публикации {post['post_date'] or 'не найдена'}")
+
         processed += 1
         try:
             result = await analyze_post(post['text'], post.get('post_date', ''), categories, post.get('links'))
@@ -240,7 +308,10 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             mark_post_processed(channel, int(msg_id))
             deferred += 1
             logging.warning(f"Отложено на разбор: нет названия или даты. {post_url}")
-            await notify(f"⚠️ Пост отложен на разбор: нет названия или даты события.\n{post_url}")
+            if deferred_urls is not None:
+                deferred_urls.append(post_url)
+            elif replay_post is None:
+                await notify(f"⚠️ Пост отложен на разбор: нет названия или даты события.\n{post_url}")
             await asyncio.sleep(1.5)
             continue
         if not result:
@@ -335,7 +406,7 @@ async def load_categories_safe() -> dict:
     return cats
 
 
-async def _run_parser_pass(progress):
+async def _run_parser_pass(progress, deferred_urls):
     logging.info("Начинаем парсинг через t.me/s/...")
     
     CHANNELS = load_channels()
@@ -396,7 +467,7 @@ async def _run_parser_pass(progress):
             channel = channel_config['channel']
             logging.info(f"Парсим @{channel}...")
             fetched, processed, saved, skipped, error, deferred = await parse_channel(
-                client, channel_config, FILTER_KEYWORDS, CATEGORIES, STOP_TAGS,
+                client, channel_config, FILTER_KEYWORDS, CATEGORIES, STOP_TAGS, deferred_urls=deferred_urls,
             )
             total_fetched += fetched
             total_processed += processed
@@ -432,14 +503,103 @@ async def _run_parser_pass(progress):
 
     return total_processed, total_saved
 
+
+async def replay_deferred_batch():
+    channels = {config['channel']: config for config in load_channels()}
+    if not channels:
+        raise RuntimeError('Список каналов для повторного разбора не загружен')
+
+    batch = [(channel, post_id, f'https://t.me/{channel}/{post_id}')
+             for channel, post_ids in DEFERRED_BATCH.items() for post_id in post_ids]
+    with closing(get_conn()) as conn:
+        conn.set_session(readonly=True)
+        with conn.cursor() as cursor:
+            cursor.execute('''
+                SELECT 'https://t.me/' || channel || '/' || post_id AS url
+                FROM public.parse_logs WHERE stage = %s AND success IS TRUE
+                UNION
+                SELECT source_url FROM public.events WHERE source_url = ANY(%s)
+            ''', (REPLAY_STAGE, [url for _, _, url in batch]))
+            handled = {row['url'] for row in cursor.fetchall()}
+
+    categories = await load_categories_safe()
+    keywords = load_keywords()
+    stop_tags = load_stop_tags()
+    processed = 0
+    saved = 0
+    skipped = 0
+    pending = []
+    async with httpx.AsyncClient() as client:
+        for channel, post_id, url in batch:
+            if url in handled:
+                skipped += 1
+                continue
+            if channel not in channels:
+                pending.append(f'{url} — канала нет в списке парсера')
+                continue
+            try:
+                page = await _fetch_one_page(client, channel, f'https://t.me/s/{channel}?before={int(post_id) + 1}')
+                post = next((candidate for candidate in page if candidate['id'] == post_id), None)
+                if post is None:
+                    pending.append(f'{url} — пост не найден в Telegram')
+                    continue
+
+                _, tried, added, _, error, deferred = await parse_channel(
+                    client, channels[channel], keywords, categories, stop_tags, replay_post=post,
+                )
+                processed += tried
+                saved += added
+                if deferred or error:
+                    reason = 'нет подтверждённой даты или названия' if deferred else 'разбор не завершился'
+                    pending.append(f'{url} — {reason}')
+                    continue
+
+                if not added:
+                    # Saved events are already checkpointed by their unique source URL.
+                    log_parse(channel=channel, post_id=post_id, model=None, fallback=False,
+                              success=True, stage=REPLAY_STAGE)
+                    skipped += 1
+            except Exception as exc:
+                logging.error(f'Повторный разбор {url}: {type(exc).__name__}')
+                pending.append(f'{url} — ошибка {type(exc).__name__}')
+
+    summary = (f'Повторный разбор отложенных постов от 26 ноября\n'
+               f'Всего: {len(batch)}. Сохранено: {saved}. Уже в базе или отсеяно: {skipped}. '
+               f'Осталось: {len(pending)}.')
+    if pending:
+        summary += '\n' + '\n'.join(pending)
+    logging.info(summary)
+    await notify(summary)
+
+    if dedup is not None:
+        try:
+            await dedup.finish_run(notify)
+        except Exception as exc:
+            await notify(f'⚠️ Итог проверки дублей после повторного разбора не отправлен: {type(exc).__name__}')
+    return processed, saved
+
+
 async def run_parser():
+    replay = os.getenv('REPLAY_DEFERRED') == '1'
     scope = (os.getenv('CHANNELS_PART') or 'all') + ':' + (PARSE_SINCE or '')
+    deferred_urls = []
     try:
-        with ParserPass(scope) as progress:
+        with ParserPass(REPLAY_STAGE if replay else scope) as progress:
             if not progress.locked:
                 logging.info('Другой запуск уже обрабатывает эту часть каналов')
                 return 0, 0
-            return await _run_parser_pass(progress)
+            if replay:
+                return await replay_deferred_batch()
+            return await _run_parser_pass(progress, deferred_urls)
     except Exception as exc:
+        if replay:
+            await notify(f'⚠️ Повторный разбор остановлен: {type(exc).__name__}')
+            raise
         await notify('⚠️ Парсер остановлен; место продолжения сохранено: ' + str(exc)[:250])
         raise
+    finally:
+        if deferred_urls:
+            links = '\n'.join(deferred_urls[:30])
+            extra = '\nОстальные ссылки в журнале запуска.' if len(deferred_urls) > 30 else ''
+            await notify(f'⚠️ Посты отложены на разбор: {len(deferred_urls)}. '
+                         f'Не удалось определить название или дату события.\n{links}{extra}')

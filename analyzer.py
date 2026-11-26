@@ -1,6 +1,6 @@
-# analyzer.py — v48
+# analyzer.py — v49
+# v49 (2026-11-26): Resolve relative dates from publication dates and reject unsupported years.
 # v48 (2026-11-25): Distinguish missing event details from failed requests after trying all available models.
-# v47 (2026-11-20): Identify registration separately and recognize explicit ticket sales without a price.
 # История версий (старше двух последних) — в versions_history.md
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
@@ -9,7 +9,7 @@ class IncompleteEventError(ValueError):
     """A model identified an event without a title or date."""
 
 
-def validate_analysis(data):
+def validate_analysis(data, source_text=None, published_date=''):
     """Validate the model payload before category fitting and persistence."""
     from datetime import date
     if not isinstance(data, dict):
@@ -29,11 +29,52 @@ def validate_analysis(data):
     for key in ('title', 'date', 'time', 'description', 'location', 'address', 'format', 'reg_link'):
         if data.get(key) is not None and not isinstance(data[key], str):
             raise ValueError('Invalid text: ' + key)
+    if data['is_event'] and source_text is not None:
+        data['date'] = validate_source_date(data, source_text, published_date)
     if data.get('date'):
         date.fromisoformat(data['date'])
     if data['is_event'] and (not str(data.get('title') or '').strip() or not data.get('date')):
         raise IncompleteEventError('Event title/date missing')
     return data
+
+
+def validate_source_date(data, text, published_date):
+    from datetime import date, timedelta
+
+    published = date.fromisoformat(published_date) if published_date else None
+    relative = data.get('relative_date')
+    if relative in ('today', 'tomorrow'):
+        word = 'сегодня' if relative == 'today' else 'завтра'
+        if not published or not re.search(rf'\b{word}\b', text, re.IGNORECASE):
+            return None
+        return (published + timedelta(days=relative == 'tomorrow')).isoformat()
+
+    value = data.get('date')
+    if not value:
+        return None
+    event_day = date.fromisoformat(value)
+    if not published or event_day.year != published.year:
+        short_year = event_day.year % 100
+        if not re.search(rf'(?<!\d){event_day.year}(?!\d)|'
+                         rf'(?<!\d)0?{event_day.day}[./-]0?{event_day.month}[./-]{short_year:02d}(?!\d)', text):
+            return None
+    if event_day == published and not has_explicit_calendar_day(text, event_day):
+        return None
+    return event_day.isoformat()
+
+
+def has_explicit_calendar_day(text, event_day):
+    month_names = (r'январ\w*|jan(?:uary)?', r'феврал\w*|feb(?:ruary)?', r'март\w*|mar(?:ch)?',
+                   r'апрел\w*|apr(?:il)?', r'ма[йяе]|may', r'июн\w*|jun(?:e)?', r'июл\w*|jul(?:y)?',
+                   r'август\w*|aug(?:ust)?', r'сентябр\w*|sep(?:tember)?', r'октябр\w*|oct(?:ober)?',
+                   r'ноябр\w*|nov(?:ember)?', r'декабр\w*|dec(?:ember)?')
+    month_name = month_names[event_day.month - 1]
+    day_pair = r'(?:\s*(?:[-–—,]|\bи\b)\s*\d{1,2})?'
+    return event_day.isoformat() in text or bool(re.search(
+        rf'(?<!\d)0?{event_day.day}(?:[./-]0?{event_day.month}(?!\d)|{day_pair}\s+(?:{month_name})\b)'
+        rf'|\b(?:{month_name})\s+0?{event_day.day}(?!\d)',
+        text, re.IGNORECASE,
+    ))
 
 import os
 import re
@@ -354,6 +395,17 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}, po
         l1_list=l1_list,
         l2_json=l2_json
     )
+    # This extension applies to the parser only; the admin bot has its own shared prompt copy.
+    prompt += (
+        '\nУточнение правил даты для этого разбора. Добавь поле "relative_date": "today", "tomorrow" или null. '
+        'Если «сегодня» или «завтра» прямо относится ко времени конкретного события и конкретное число не написано, '
+        'верни "today" или "tomorrow" соответственно. При известной дате публикации считай от неё. '
+        'Это исключение из правила про день и месяц. При неизвестной дате публикации оставь date = null. '
+        'При явно указанном дне и месяце верни relative_date = null и используй год публикации, если год события не назван. '
+        '«Сегодня» о публикации, продаже билетов, начале регистрации или обновлении афиши не является датой события. '
+        'Привязывай дату к названию того же события: «завтра экскурсия на выставке» — это дата экскурсии. '
+        'Одно лишь расписание часов или «каждое воскресенье» — без даты. Оставь date = null.'
+    )
 
     max_tokens = 6000 if ANALYZE_THINKING else 2000
     last_rate_err = None
@@ -384,7 +436,7 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}, po
                 data = json.loads(raw.strip())
                 if isinstance(data, list):
                     data = data[0] if data else None
-                data = validate_analysis(data)
+                data = validate_analysis(data, text[:3000], post_date)
                 reg_link = (data.get('reg_link') or '').strip()
                 data['reg_link'] = reg_link if reg_link in post_links else None
                 data['has_registration'] = data.get('has_registration') is True or data['reg_link'] is not None
