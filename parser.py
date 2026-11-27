@@ -1,6 +1,6 @@
-# parser.py — v56
+# parser.py — v57
+# v57 (2026-11-27): Continue channel traversal after Telegram read failures and report affected channels together.
 # v56 (2026-11-27): Send new review links once and resume unfinished retries on the backup run.
-# v55 (2026-11-27): Continue the channel pass and replay unfinished posts from a persistent queue.
 # История версий (старше двух последних) — в versions_history.md
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
@@ -62,7 +62,13 @@ except ValueError:
 USE_SCREEN = (os.getenv('USE_SCREEN', '0') or '0').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
-async def fetch_channel_posts(client: httpx.AsyncClient, channel: str, pages: int = None) -> list[dict]:
+class ChannelReadError(RuntimeError):
+    """Telegram did not serve a channel page."""
+
+
+async def fetch_channel_posts(
+    client: httpx.AsyncClient, channel: str, pages: int = None,
+) -> tuple[list[dict], str | None]:
     pages = PARSE_PAGES if pages is None else max(1, pages)
     all_posts = []
     seen_ids = set()
@@ -73,7 +79,12 @@ async def fetch_channel_posts(client: httpx.AsyncClient, channel: str, pages: in
         if before:
             url += f'?before={before}'
 
-        page_posts = await _fetch_one_page(client, channel, url)
+        try:
+            page_posts = await _fetch_one_page(client, channel, url)
+        except ChannelReadError as exc:
+            reason = f'страница {page + 1}: {exc}'
+            logging.error('@%s: %s', channel, reason)
+            return all_posts, reason
         if not page_posts:
             break
 
@@ -94,44 +105,44 @@ async def fetch_channel_posts(client: httpx.AsyncClient, channel: str, pages: in
 
     if pages > 1:
         logging.info(f"@{channel}: собрано {len(all_posts)} постов за {pages} стр.")
-    return all_posts
+    return all_posts, None
 
 
 async def _fetch_one_page(client: httpx.AsyncClient, channel: str, url: str) -> list[dict]:
     try:
         response = await client.get(url, headers=HEADERS, timeout=15)
-        if response.status_code != 200:
-            logging.error(f"❌ @{channel} недоступен: HTTP {response.status_code}")
-            raise RuntimeError(f'@{channel}: HTTP {response.status_code}')
-        
-        soup = BeautifulSoup(response.text, 'html.parser')
-        messages = soup.find_all('div', class_='tgme_widget_message')
-        
-        posts = []
-        for msg in messages:
-            msg_link = msg.get('data-post', '')
-            if not msg_link:
-                continue
-            msg_id = msg_link.split('/')[-1]
-            
-            text_div = msg.find('div', class_='tgme_widget_message_text')
-            text = text_div.get_text(separator='\n').strip() if text_div else ''
-            
-            if not text:
-                continue
-            
-            posts.append({
-                'id': msg_id,
-                'text': text,
-                'url': f'https://t.me/{channel}/{msg_id}',
-                'post_date': publication_date(msg),
-                'links': post_links(text_div),
-            })
-        
-        return posts
-    except Exception as e:
-        logging.error(f"❌ Ошибка получения @{channel}: {e}")
-        raise
+    except httpx.TimeoutException as exc:
+        raise ChannelReadError('Telegram не ответил вовремя') from exc
+    except httpx.RequestError as exc:
+        raise ChannelReadError(f'Ошибка соединения с Telegram ({type(exc).__name__})') from exc
+    if response.status_code != 200:
+        raise ChannelReadError(f'HTTP {response.status_code}')
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+    messages = soup.find_all('div', class_='tgme_widget_message')
+
+    posts = []
+    for msg in messages:
+        msg_link = msg.get('data-post', '')
+        if not msg_link:
+            continue
+        msg_id = msg_link.split('/')[-1]
+
+        text_div = msg.find('div', class_='tgme_widget_message_text')
+        text = text_div.get_text(separator='\n').strip() if text_div else ''
+
+        if not text:
+            continue
+
+        posts.append({
+            'id': msg_id,
+            'text': text,
+            'url': f'https://t.me/{channel}/{msg_id}',
+            'post_date': publication_date(msg),
+            'links': post_links(text_div),
+        })
+
+    return posts
 
 
 def publication_date(message):
@@ -211,7 +222,10 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
     error = 0
     deferred = 0
 
-    posts = [replay_post] if replay_post is not None else await fetch_channel_posts(client, channel)
+    if replay_post is None:
+        posts, read_error = await fetch_channel_posts(client, channel)
+    else:
+        posts, read_error = [replay_post], None
     fetched = len(posts)
     
     for post in posts:
@@ -369,7 +383,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
         
         await asyncio.sleep(1.5)
     
-    return fetched, processed, saved, skipped, error, deferred
+    return fetched, processed, saved, skipped, error, deferred, read_error
 
 
 # ===== patch 1 (v49): справочник категорий never empty =====
@@ -439,6 +453,7 @@ async def _run_parser_pass(progress, deadline, all_channels):
     total_skipped = 0
     total_error = 0
     channels_done = 0
+    channel_read_errors = []
 
     github_run_id = os.environ.get('GITHUB_RUN_ID')
     github_run_url = f"https://github.com/marti-rgb/events-bot/actions/runs/{github_run_id}" if github_run_id else None
@@ -457,7 +472,7 @@ async def _run_parser_pass(progress, deadline, all_channels):
                 break
             channel = channel_config['channel']
             logging.info(f"Парсим @{channel}...")
-            fetched, processed, saved, skipped, error, deferred = await parse_channel(
+            fetched, processed, saved, skipped, error, deferred, read_error = await parse_channel(
                 client, channel_config, FILTER_KEYWORDS, CATEGORIES, STOP_TAGS,
             )
             total_fetched += fetched
@@ -466,9 +481,23 @@ async def _run_parser_pass(progress, deadline, all_channels):
             total_skipped += skipped
             total_error += error + deferred
             progress.advance(idx + 1)
-            channels_done += 1
+            if read_error:
+                channel_read_errors.append(f'@{channel} — {read_error}')
+            else:
+                channels_done += 1
             logging.info(f"@{channel}: получено {fetched}, обработано {processed}, сохранено {saved}")
             await asyncio.sleep(2)
+
+    if channel_read_errors:
+        text = f'⚠️ Каналов с ошибками чтения — {len(channel_read_errors)}.'
+        for detail in channel_read_errors:
+            if len(text) + len(detail) + 1 > 3700:
+                text += '\nПолный список есть в журнале GitHub.'
+                if github_run_url:
+                    text += f'\n{github_run_url}'
+                break
+            text += f'\n{detail}'
+        await notify(text)
 
     if session_id:
         finish_parse_session(session_id, {
@@ -512,7 +541,7 @@ async def _retry_posts(settings, deadline, *, include_review, pass_key):
                     post_retries.finish_retry(channel, post_id, 'review', 'fetch', 'Пост недоступен в веб-версии Telegram',
                                               attempts, pass_key=pass_key)
                     continue
-                _, tried, added, _, error, deferred = await parse_channel(
+                _, tried, added, _, error, deferred, _ = await parse_channel(
                     client, channels[channel], keywords, categories, stop_tags,
                     replay_post=post, replay_attempts=attempts, retry_pass=pass_key,
                 )
@@ -523,9 +552,10 @@ async def _retry_posts(settings, deadline, *, include_review, pass_key):
                     post_retries.finish_retry(channel, post_id, 'resolved', 'save', reason, attempts,
                                               pass_key=pass_key)
             except Exception as exc:
-                logging.error(f'Повторный разбор {url}: {type(exc).__name__}')
+                reason = str(exc) if isinstance(exc, ChannelReadError) else type(exc).__name__
+                logging.error(f'Повторный разбор {url}: {reason}')
                 post_retries.finish_retry(channel, post_id, 'pending', 'retry',
-                                          f'Ошибка повторного разбора: {type(exc).__name__}', attempts,
+                                          f'Ошибка повторного разбора: {reason}', attempts,
                                           pass_key=pass_key)
     return processed, saved, True
 
