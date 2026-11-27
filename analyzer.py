@@ -1,12 +1,17 @@
-# analyzer.py — v49
+# analyzer.py — v50
+# v50 (2026-11-27): Record model outcomes and provider retry times for the post queue.
 # v49 (2026-11-26): Resolve relative dates from publication dates and reject unsupported years.
-# v48 (2026-11-25): Distinguish missing event details from failed requests after trying all available models.
 # История версий (старше двух последних) — в versions_history.md
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
 
 class IncompleteEventError(ValueError):
     """A model identified an event without a title or date."""
+
+    def __init__(self, missing, date_rejected=False):
+        super().__init__('Event title/date missing')
+        self.missing = missing
+        self.date_rejected = date_rejected
 
 
 def validate_analysis(data, source_text=None, published_date=''):
@@ -29,12 +34,15 @@ def validate_analysis(data, source_text=None, published_date=''):
     for key in ('title', 'date', 'time', 'description', 'location', 'address', 'format', 'reg_link'):
         if data.get(key) is not None and not isinstance(data[key], str):
             raise ValueError('Invalid text: ' + key)
+    raw_date = data.get('date')
     if data['is_event'] and source_text is not None:
         data['date'] = validate_source_date(data, source_text, published_date)
     if data.get('date'):
         date.fromisoformat(data['date'])
-    if data['is_event'] and (not str(data.get('title') or '').strip() or not data.get('date')):
-        raise IncompleteEventError('Event title/date missing')
+    if data['is_event']:
+        missing = [field for field in ('title', 'date') if not str(data.get(field) or '').strip()]
+        if missing:
+            raise IncompleteEventError(missing, bool(raw_date and not data.get('date')))
     return data
 
 
@@ -81,6 +89,7 @@ import re
 import json
 import time
 import logging
+from email.utils import parsedate_to_datetime
 from database import log_parse
 from openai import OpenAI
 
@@ -140,7 +149,51 @@ def _retry_after(err, default=5.0, cap=15.0) -> float:
     return max(0.5, min(seconds, cap))
 
 
-def _chat(provider, client, model, prompt, max_tokens, temperature, thinking):
+def _model_attempt(attempts, model, result, **details):
+    if attempts is not None:
+        attempts.append({'модель': model, 'результат': result, **details})
+
+
+def _record_model_error(attempts, model, error):
+    if attempts is None:
+        return
+    details = {}
+    if _is_rate_limit(error):
+        now = time.time()
+        headers = getattr(getattr(error, 'response', None), 'headers', {}) or {}
+        delay = 0
+        hint = headers.get('retry-after') or headers.get('Retry-After')
+        if hint:
+            try:
+                delay = float(hint)
+            except ValueError:
+                try:
+                    delay = parsedate_to_datetime(hint).timestamp() - now
+                except (ValueError, TypeError, OverflowError):
+                    pass
+        message = str(error)
+        duration = re.search(r'try again in\s+((?:\d+(?:\.\d+)?\s*[hms]\s*)+)', message, re.I)
+        if duration:
+            units = {'h': 3600, 'm': 60, 's': 1}
+            seconds = sum(float(value) * units[unit.lower()] for value, unit in
+                          re.findall(r'(\d+(?:\.\d+)?)\s*([hms])', duration[1], re.I))
+            delay = max(delay, seconds)
+        details['retry_at'] = now + (delay if 0 < delay < float('inf') else 60)
+        limit = re.search(r'\b(tokens|requests) per (minute|day)\b', message, re.I)
+        if limit:
+            limits = {'tokens': 'токенов', 'requests': 'запросов', 'minute': 'в минуту', 'day': 'в сутки'}
+            details['лимит'] = f'{limits[limit[1].lower()]} {limits[limit[2].lower()]}'
+        for label, key in (('limit', 'порог'), ('used', 'использовано'), ('requested', 'запрошено')):
+            number = re.search(rf'\b{label}\s*[:=]?\s*(\d[\d,]*)', message, re.I)
+            if number:
+                details[key] = int(number[1].replace(',', ''))
+        _model_attempt(attempts, model, 'Лимит запросов (429)', **details)
+        return
+    code = getattr(error, 'status_code', None)
+    _model_attempt(attempts, model, f'Ошибка HTTP {code}' if isinstance(code, int) else type(error).__name__)
+
+
+def _chat(provider, client, model, prompt, max_tokens, temperature, thinking, *, retry=True):
     kwargs = dict(
         model=model,
         messages=[{"role": "user", "content": prompt}],
@@ -149,7 +202,8 @@ def _chat(provider, client, model, prompt, max_tokens, temperature, thinking):
     )
     if provider == 'zai':
         kwargs['extra_body'] = {"thinking": {"type": "enabled" if thinking else "disabled"}}
-    return client.chat.completions.create(**kwargs)
+    sender = client if retry else client.with_options(max_retries=0)
+    return sender.chat.completions.create(**kwargs)
 
 
 def _strip_fence(raw: str) -> str:
@@ -217,7 +271,7 @@ PICK_L1_PROMPT = """К какому разделу относится это м�
 Ответь ТОЛЬКО валидным JSON без пояснений: {{"category_l1_arr": ["раздел"]}}"""
 
 
-def _pick_l1(post_text: str, data: dict, valid_l1: list):
+def _pick_l1(post_text: str, data: dict, valid_l1: list, attempts=None):
     """Returns a list of sections (may be empty) or None if no model answered."""
     title = str(data.get('title') or '').strip()
     desc = str(data.get('description') or '').strip()
@@ -230,26 +284,31 @@ def _pick_l1(post_text: str, data: dict, valid_l1: list):
             if client is None:
                 continue
             try:
-                response = _chat(provider, client, model, prompt, max_tokens=400, temperature=0.0, thinking=False)
+                response = _chat(provider, client, model, prompt, max_tokens=400, temperature=0.0,
+                                 thinking=False, retry=attempts is None)
                 raw = _strip_fence(response.choices[0].message.content)
                 if not raw:
+                    _model_attempt(attempts, f'{provider}/{model}', 'Пустой ответ при подборе раздела')
                     continue
                 ans = json.loads(raw)
                 if isinstance(ans, dict):
                     ans = ans.get('category_l1_arr', [])
                 fitted, _ = _fit_l1(ans, valid_l1)
+                _model_attempt(attempts, f'{provider}/{model}', 'Подбор раздела завершён')
                 return fitted[:2]
             except json.JSONDecodeError as e:
+                _model_attempt(attempts, f'{provider}/{model}', 'Ошибка формата ответа при подборе раздела')
                 logging.warning(f"pick_l1 JSON error {provider}/{model}: {e}")
                 continue
             except Exception as e:
+                _record_model_error(attempts, f'{provider}/{model}', e)
                 if _is_rate_limit(e):
                     rate_limited = True
                     last_rate_err = e
                     continue
                 logging.warning(f"pick_l1 error {provider}/{model}: {e}")
                 continue
-        if attempt == 1 and rate_limited:
+        if attempt == 1 and rate_limited and attempts is None:
             time.sleep(_retry_after(last_rate_err))
             continue
         break
@@ -329,7 +388,7 @@ SCREEN_PROMPT = """Определи: является ли этот пост а�
 Ответь ТОЛЬКО валидным JSON без пояснений:
 {{"is_event": true}} или {{"is_event": false}}"""
 
-async def screen_post(text: str) -> tuple[bool, str | None]:
+async def screen_post(text: str, *, attempts=None) -> tuple[bool, str | None]:
     """Возвращает (это событие?, какая модель ответила).
     Вторым значением None — если не ответила ни одна модель."""
     if not text or len(text.strip()) < 20:
@@ -343,19 +402,22 @@ async def screen_post(text: str) -> tuple[bool, str | None]:
             if client is None:
                 continue
             try:
-                response = _chat(provider, client, model, prompt,
-                                 max_tokens=20, temperature=0.0, thinking=False)
+                response = _chat(provider, client, model, prompt, max_tokens=20,
+                                 temperature=0.0, thinking=False, retry=attempts is None)
                 raw = (response.choices[0].message.content or '').strip()
                 if raw.startswith('```'):
                     raw = raw.split('```')[1]
                     if raw.startswith('json'):
                         raw = raw[4:]
                 data = json.loads(raw.strip())
+                _model_attempt(attempts, f'{provider}/{model}', 'Предварительный отбор завершён')
                 return bool(data.get('is_event', True)), f"{provider}/{model}"
             except json.JSONDecodeError as e:
+                _model_attempt(attempts, f'{provider}/{model}', 'Ошибка формата предварительного ответа')
                 logging.warning(f"screen_post JSON error {provider}/{model}: {e}")
                 continue
             except Exception as e:
+                _record_model_error(attempts, f'{provider}/{model}', e)
                 if _is_rate_limit(e):
                     rate_limited = True
                     last_rate_err = e
@@ -364,7 +426,7 @@ async def screen_post(text: str) -> tuple[bool, str | None]:
                 logging.warning(f"screen_post error {provider}/{model}: {e}")
                 continue
 
-        if attempt == 1 and rate_limited:
+        if attempt == 1 and rate_limited and attempts is None:
             wait = _retry_after(last_rate_err)
             logging.warning(f"screen_post: все модели по лимиту, пауза {wait}s и один повтор")
             time.sleep(wait)
@@ -375,8 +437,10 @@ async def screen_post(text: str) -> tuple[bool, str | None]:
     return True, None
 
 
-async def analyze_post(text: str, post_date: str = '', categories: dict = {}, post_links: dict | None = None) -> dict | None:
+async def analyze_post(text: str, post_date: str = '', categories: dict = {}, post_links: dict | None = None,
+                       *, attempts=None) -> dict | None:
     if not text or len(text.strip()) < 20:
+        _model_attempt(attempts, 'local', 'В посте меньше 20 символов текста')
         return None
 
     l1_list = "/".join(categories.keys()) if categories else "Культура и искусство/Музыка/Кино/Театр и шоу/Выставки/Спорт и активности/Образование и лекции/Игры/Вечеринки и тусовки/Фестивали/Для детей/Знакомства/Психология и практики/Бизнес и нетворкинг/Творчество/Онлайн"
@@ -419,11 +483,11 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}, po
                 continue
             model_used = f"{provider}/{model}"
             try:
-                response = _chat(provider, client, model, prompt,
-                                 max_tokens=max_tokens, temperature=0.1,
-                                 thinking=ANALYZE_THINKING)
+                response = _chat(provider, client, model, prompt, max_tokens=max_tokens, temperature=0.1,
+                                 thinking=ANALYZE_THINKING, retry=attempts is None)
                 raw = response.choices[0].message.content
                 if not raw:
+                    _model_attempt(attempts, model_used, 'Пустой ответ')
                     other_failure = True
                     continue
                 raw = raw.strip()
@@ -451,8 +515,9 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}, po
                     fitted, left = _fit_l1(data.get('category_l1_arr'), valid_l1)
                     data['category_l1_arr'] = fitted
                     if not fitted and data.get('is_event'):
-                        picked = _pick_l1(text, data, valid_l1)
+                        picked = _pick_l1(text, data, valid_l1, attempts)
                         if picked is None:
+                            _model_attempt(attempts, model_used, 'Нет подтверждённого раздела справочника')
                             logging.warning(f"{model_used}: категория {left} не из справочника, повторный запрос не ответил — пост повторится в следующем прогоне")
                             return None
                         data['category_l1_arr'] = picked
@@ -461,26 +526,37 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}, po
                     data['is_event'] = False
                 if data:
                     data['model'] = model_used
+                _model_attempt(attempts, model_used, 'Ответ прошёл проверку')
                 logging.info(f"{model_used}: {data}")
                 return data
 
             except json.JSONDecodeError as e:
+                _model_attempt(attempts, model_used, 'Ошибка формата ответа')
                 other_failure = True
                 logging.warning(f"JSON parse error {model_used}: {e}")
                 continue
             except Exception as e:
                 if isinstance(e, IncompleteEventError):
                     incomplete_event = e
+                    fields = {'title': 'название', 'date': 'дата'}
+                    _model_attempt(attempts, model_used, 'Не хватает данных для карточки',
+                                   **{'поля': [fields[field] for field in e.missing],
+                                      'дата не подтверждена текстом': e.date_rejected,
+                                      'дата публикации': post_date or None})
                     logging.warning(f"{model_used}: {e}")
                 elif _is_rate_limit(e):
+                    _record_model_error(attempts, model_used, e)
                     other_failure = True
                     rate_limited = True
                     last_rate_err = e
                     logging.warning(f"rate limit {model_used} — следующая модель")
                     continue
                 else:
+                    _record_model_error(attempts, model_used, e)
                     other_failure = True
                     logging.error(f"API error {model_used}: {e}")
+                if attempts is not None:
+                    continue
                 log_parse(
                     channel='',
                     post_id='',
@@ -491,14 +567,14 @@ async def analyze_post(text: str, post_date: str = '', categories: dict = {}, po
                 )
                 continue
 
-        if attempt == 1 and rate_limited:
+        if attempt == 1 and rate_limited and attempts is None:
             wait = _retry_after(last_rate_err)
             logging.warning(f"analyze_post: все модели по лимиту, пауза {wait}s и один повтор")
             time.sleep(wait)
             continue
         break
 
-    if last_rate_err is not None:
+    if last_rate_err is not None and attempts is None:
         log_parse(
             channel='',
             post_id='',
