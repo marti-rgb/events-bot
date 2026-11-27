@@ -1,6 +1,6 @@
-# parser.py — v55
+# parser.py — v56
+# v56 (2026-11-27): Send new review links once and resume unfinished retries on the backup run.
 # v55 (2026-11-27): Continue the channel pass and replay unfinished posts from a persistent queue.
-# v54 (2026-11-26): Recover publication dates and reprocess the November 26 deferred posts.
 # История версий (старше двух последних) — в versions_history.md
 # Переменные в GitHub → Settings → Variables:
 #   ANALYZE_THINKING=0  PARSE_PAGES=1  USE_SCREEN=0  CHANNELS_PART=(пусто)
@@ -10,7 +10,7 @@
 import asyncio
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 import httpx
@@ -191,14 +191,15 @@ def post_links(text_div) -> dict[str, str]:
             break
     return links
 
-def _hold_post(channel, post_id, stage, reason, attempts, replay, *, incomplete=False):
+def _hold_post(channel, post_id, stage, reason, attempts, replay, *, incomplete=False, pass_key=None):
     if replay:
-        post_retries.finish_retry(channel, post_id, 'review' if incomplete else 'pending', stage, reason, attempts)
+        post_retries.finish_retry(channel, post_id, 'review' if incomplete else 'pending', stage, reason, attempts,
+                                  pass_key=pass_key)
     else:
         post_retries.defer_post(channel, post_id, stage, reason, attempts)
 
 
-async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_keywords: list = [], categories: dict = {}, stop_tags: list = [], *, replay_post=None, replay_attempts=None):
+async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_keywords: list = [], categories: dict = {}, stop_tags: list = [], *, replay_post=None, replay_attempts=None, retry_pass=None):
     channel = channel_config['channel']
     exclude_ids = [str(i) for i in channel_config.get('exclude_threads', [])]
     whitelist_ids = [str(i) for i in (channel_config.get('threads') or [])]
@@ -268,7 +269,7 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             )
             if screen_model is None:
                 _hold_post(channel, msg_id, 'screen', 'Предварительный отбор не завершился', attempts,
-                           replay_post is not None)
+                           replay_post is not None, pass_key=retry_pass)
                 error += 1
                 continue
             if not is_event:
@@ -299,7 +300,8 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             )
             fields = {'title': 'название', 'date': 'дата'}
             reason = 'Не хватает данных: ' + ', '.join(fields[field] for field in exc.missing)
-            _hold_post(channel, msg_id, 'analyze', reason, attempts, replay_post is not None, incomplete=True)
+            _hold_post(channel, msg_id, 'analyze', reason, attempts, replay_post is not None,
+                       incomplete=True, pass_key=retry_pass)
             deferred += 1
             logging.warning(f"Отложено на разбор: {reason.lower()}. {post_url}")
             await asyncio.sleep(1.5)
@@ -308,7 +310,8 @@ async def parse_channel(client: httpx.AsyncClient, channel_config: dict, filter_
             error += 1
             too_short = bool(attempts and attempts[-1]['модель'] == 'local')
             reason = 'В посте меньше 20 символов текста' if too_short else 'Модели не завершили разбор поста'
-            _hold_post(channel, msg_id, 'analyze', reason, attempts, replay_post is not None, incomplete=too_short)
+            _hold_post(channel, msg_id, 'analyze', reason, attempts, replay_post is not None,
+                       incomplete=too_short, pass_key=retry_pass)
         log_parse(
             channel=channel,
             post_id=str(msg_id),
@@ -399,12 +402,8 @@ async def load_categories_safe() -> dict:
     return cats
 
 
-async def _run_parser_pass(progress, deadline):
+async def _run_parser_pass(progress, deadline, all_channels):
     logging.info("Начинаем парсинг через t.me/s/...")
-    
-    all_channels = load_channels()
-    if not all_channels:
-        raise RuntimeError('Список каналов не загружен; проход не изменён')
     CHANNELS = all_channels
 
     # Обработать только часть списка каналов. Формат "N/M", например "2/5" —
@@ -424,7 +423,7 @@ async def _run_parser_pass(progress, deadline):
 
     CHANNELS = progress.begin(CHANNELS, os.getenv('IS_BACKUP_RUN') == '1')
     if CHANNELS is None:
-        logging.info('Завершённый проход сегодня уже был; резервный запуск пропущен')
+        logging.info('Обход каналов сегодня уже завершён')
         return None
     FILTER_KEYWORDS = load_keywords()
     CATEGORIES = await load_categories_safe()  # patch 1 (v49)
@@ -486,64 +485,100 @@ async def _run_parser_pass(progress, deadline):
     return total_processed, total_saved, settings
 
 
-async def _retry_posts(settings, deadline, *, include_review):
+async def _retry_posts(settings, deadline, *, include_review, pass_key):
     channels, keywords, categories, stop_tags = settings
     channels = {config['channel']: config for config in channels}
     processed = 0
     saved = 0
     async with httpx.AsyncClient() as client:
-        for row in post_retries.retry_targets(include_review):
+        for row in post_retries.retry_targets(include_review, pass_key):
             if time.monotonic() >= deadline:
-                break
+                return processed, saved, False
             channel, post_id = row['channel'], row['post_id']
             url = f'https://t.me/{channel}/{post_id}'
             attempts = []
             if row['already_saved']:
-                post_retries.finish_retry(channel, post_id, 'resolved', 'save', 'Карточка уже в базе', attempts)
+                post_retries.finish_retry(channel, post_id, 'resolved', 'save', 'Карточка уже в базе', attempts,
+                                          pass_key=pass_key)
                 continue
             if channel not in channels:
-                post_retries.finish_retry(channel, post_id, 'review', 'fetch', 'Канала нет в списке парсера', attempts)
+                post_retries.finish_retry(channel, post_id, 'review', 'fetch', 'Канала нет в списке парсера', attempts,
+                                          pass_key=pass_key)
                 continue
             try:
                 page = await _fetch_one_page(client, channel, f'https://t.me/s/{channel}?before={int(post_id) + 1}')
                 post = next((item for item in page if item['id'] == post_id), None)
                 if post is None:
-                    post_retries.finish_retry(channel, post_id, 'review', 'fetch', 'Пост недоступен в веб-версии Telegram', attempts)
+                    post_retries.finish_retry(channel, post_id, 'review', 'fetch', 'Пост недоступен в веб-версии Telegram',
+                                              attempts, pass_key=pass_key)
                     continue
                 _, tried, added, _, error, deferred = await parse_channel(
                     client, channels[channel], keywords, categories, stop_tags,
-                    replay_post=post, replay_attempts=attempts,
+                    replay_post=post, replay_attempts=attempts, retry_pass=pass_key,
                 )
                 processed += tried
                 saved += added
                 if not error and not deferred:
                     reason = 'Карточка сохранена' if added else 'Пост обработан без создания новой карточки'
-                    post_retries.finish_retry(channel, post_id, 'resolved', 'save', reason, attempts)
+                    post_retries.finish_retry(channel, post_id, 'resolved', 'save', reason, attempts,
+                                              pass_key=pass_key)
             except Exception as exc:
                 logging.error(f'Повторный разбор {url}: {type(exc).__name__}')
                 post_retries.finish_retry(channel, post_id, 'pending', 'retry',
-                                          f'Ошибка повторного разбора: {type(exc).__name__}', attempts)
-    return processed, saved
+                                          f'Ошибка повторного разбора: {type(exc).__name__}', attempts,
+                                          pass_key=pass_key)
+    return processed, saved, True
 
 
-async def _replay_and_report(settings, deadline, *, manual):
+async def _send_retry_summary(rows, pass_reference, *, manual):
+    resolved = sum(row['status'] == 'resolved' for row in rows)
+    pending = sum(row['status'] == 'pending' for row in rows)
+    new_reviews = [row for row in rows if row['status'] == 'review' and row['review_notified_at'] is None]
+    should_send = bool(manual or resolved or pending or new_reviews)
+    visible = []
+    text = f'Повторный разбор постов\nЗавершено сегодня: {resolved}. Ждут автоповтора: {pending}.'
+    if new_reviews:
+        text += f'\nНовые посты, которые не удалось разобрать: {len(new_reviews)}.'
+        for row in new_reviews[:20]:
+            link = f"\nhttps://t.me/{row['channel']}/{row['post_id']} — {row['reason']}"
+            if len(text) + len(link) > 3800:
+                break
+            text += link
+            visible.append(row)
+        if len(visible) != len(new_reviews):
+            text += '\nПодробности по всем постам есть в диагностике.'
+    if not should_send and not pass_reference:
+        return
+    # A crash or uncertain delivery cannot cause a second copy of this summary.
+    # The report has already been saved to diagnostics before claiming delivery.
+    stamp = post_retries.claim_summary(visible, pass_reference)
+    if should_send and await notify(text) is False:
+        post_retries.release_summary(visible, pass_reference, stamp)
+
+
+async def _replay_and_report(settings, deadline, *, manual, pass_reference=None):
     with ParserPass('post-retries') as lock:
         if not lock.locked:
             logging.info('Другой запуск уже повторно разбирает посты')
             return 0, 0
-        try:
-            return await _retry_posts(settings, deadline, include_review=manual)
-        finally:
-            rows = post_retries.diagnostic_report()
-            post_retries.print_diagnostics(rows, publish=True)
-            remaining = [row for row in rows if row['status'] != 'resolved']
-            if rows or manual:
-                lines = [f"Повторный разбор постов. Завершено сегодня: {len(rows) - len(remaining)}. Осталось: {len(remaining)}."]
-                for row in remaining[:20]:
-                    lines.append(f"https://t.me/{row['channel']}/{row['post_id']} — {row['reason']}")
-                if len(remaining) > 20:
-                    lines.append('Все посты и подробности есть в журнале диагностики.')
-                await notify('\n'.join(lines))
+        pass_key = None
+        if pass_reference:
+            scope, started_at = pass_reference
+            pass_key = f'{scope}:{started_at.astimezone(timezone.utc).isoformat()}'
+        processed, saved, complete = await _retry_posts(settings, deadline, include_review=manual,
+                                                        pass_key=pass_key)
+        rows = post_retries.diagnostic_report()
+        post_retries.print_diagnostics(rows, publish=True)
+        if complete:
+            await _send_retry_summary(rows, pass_reference, manual=manual)
+        return processed, saved
+
+
+async def _retry_settings(channels=None):
+    channels = load_channels() if channels is None else channels
+    if not channels:
+        raise RuntimeError('Список каналов не загружен')
+    return channels, load_keywords(), await load_categories_safe(), load_stop_tags()
 
 
 async def run_parser():
@@ -554,22 +589,30 @@ async def run_parser():
     deadline = time.monotonic() + MAX_RUN_MINUTES * 60
     try:
         if manual_replay:
-            channels = load_channels()
-            if not channels:
-                raise RuntimeError('Список каналов не загружен')
-            settings = (channels, load_keywords(), await load_categories_safe(), load_stop_tags())
+            settings = await _retry_settings()
             processed, saved = await _replay_and_report(settings, deadline, manual=True)
         else:
             with ParserPass(scope) as progress:
                 if not progress.locked:
                     logging.info('Другой запуск уже обрабатывает эту часть каналов')
                     return 0, 0
-                outcome = await _run_parser_pass(progress, deadline)
+                channels = load_channels()
+                if not channels:
+                    raise RuntimeError('Список каналов не загружен; проход не изменён')
+                outcome = await _run_parser_pass(progress, deadline, channels)
+                retry_enabled = full_run or os.getenv('GITHUB_EVENT_NAME') == 'schedule'
+                state = post_retries.pass_state(scope) if retry_enabled else None
                 if outcome is None:
-                    return 0, 0
-                processed, saved, settings = outcome
-                if full_run or os.getenv('GITHUB_EVENT_NAME') == 'schedule':
-                    retried, restored = await _replay_and_report(settings, deadline, manual=False)
+                    if not state or state['retries_complete']:
+                        return 0, 0
+                    logging.info('Резервный запуск доделывает повторы и сводку')
+                    processed, saved, settings = 0, 0, await _retry_settings(channels)
+                else:
+                    processed, saved, settings = outcome
+                if state and state['channels_complete'] and not state['retries_complete']:
+                    retried, restored = await _replay_and_report(
+                        settings, deadline, manual=False, pass_reference=(scope, state['started_at']),
+                    )
                     processed += retried
                     saved += restored
         if dedup is not None:
