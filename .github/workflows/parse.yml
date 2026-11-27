@@ -1,7 +1,6 @@
-# parse.yml — v45
+# parse.yml — v46
+# v46 (2026-11-27): Replay unfinished posts across all dates and report them from each daily pass.
 # v45 (2026-11-26): Add a manual replay of the 15 deferred posts from November 26.
-# v44 — task 56: keys for Cloudflare Workers AI (CF_ACCOUNT_ID, CF_AI_TOKEN) and the duplicate switches
-#       DUP_ON / DUP_MODEL / DUP_FILL_MAX. DUP_ON=0 turns the whole duplicate check off without touching code.
 # Earlier versions: archive/versions_history.md.
 name: Parse Events
 on:
@@ -31,7 +30,7 @@ on:
         type: string
         default: ''
       replay_deferred:
-        description: 'Повторно разобрать 15 отложенных постов от 26 ноября'
+        description: 'Повторно разобрать все незавершённые посты'
         type: boolean
         default: false
 jobs:
